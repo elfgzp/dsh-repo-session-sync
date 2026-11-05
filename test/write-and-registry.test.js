@@ -19,6 +19,7 @@ import {
   readSessionDir,
   scanZstdFrames,
   writeSession,
+  appendToSession,
   currentLogFilename,
 } from '../src/session-store.js'
 import {
@@ -772,4 +773,316 @@ test('rollbackNewSessions：空输入直接返回，不抛错', async () => {
     writtenByThisRun: [],
   })
   assert.deepEqual(result.removed, [])
+})
+
+// ─────────────────────────────────────────────────────────────
+// appendToSession：增量追加（红线要求）
+// ─────────────────────────────────────────────────────────────
+
+function makeAppendEvents(startSeq, count) {
+  return Array.from({ length: count }, (_, i) => ({
+    type: 'assistant/message',
+    seq: startSeq + i,
+    time: 1_700_000_000_000 + (startSeq + i) * 1000,
+    data: { text: `appended ${startSeq + i}` },
+  }))
+}
+
+test('appendToSession：追加后事件完整且可读回', async (t) => {
+  if (!hasNativeZstd) {
+    t.diagnostic('无原生 zstd 压缩，跳过')
+    return
+  }
+  const sandbox = await makeSandbox()
+  try {
+    const backupDir = join(sandbox.home, 'backups')
+    const payload = makePayload('append-basic', { events: 4 })
+    const first = await writeSession(payload, { sessionsRoot: sandbox.sessionsRoot, backupDir })
+    const dir = first.sessionDir
+
+    const result = await appendToSession(
+      {
+        sessionId: payload.sessionId,
+        header: payload.header,
+        events: makeAppendEvents(4, 3),
+      },
+      { sessionsRoot: sandbox.sessionsRoot, backupDir }
+    )
+
+    assert.equal(result.appended, 3)
+    assert.equal(result.nextSeq, 7)
+    assert.ok(result.backupPath !== null, '追加前必须有备份')
+
+    const record = await readSessionDir(dir)
+    assert.equal(record.nextSeq, 7, '原 4 条 + 追加 3 条')
+    assert.equal(record.events[4].seq, 4)
+    assert.equal(record.events[6].seq, 6)
+    // 前 4 条的字节必须完全没变（append-only 的核心承诺）
+    assert.equal(record.events[0].data.text, 'synthetic 0')
+  } finally {
+    await sandbox.cleanup()
+  }
+})
+
+test('appendToSession：追加不改动已有事件的字节（真 append-only）', async (t) => {
+  if (!hasNativeZstd) {
+    t.diagnostic('无原生 zstd 压缩，跳过')
+    return
+  }
+  const sandbox = await makeSandbox()
+  try {
+    const backupDir = join(sandbox.home, 'backups')
+    const payload = makePayload('append-prefix', { events: 3 })
+    const first = await writeSession(payload, { sessionsRoot: sandbox.sessionsRoot, backupDir })
+    const dir = first.sessionDir
+    const logPath = join(dir, currentLogFilename())
+    const before = await readFile(logPath)
+
+    await appendToSession(
+      { sessionId: payload.sessionId, header: payload.header, events: makeAppendEvents(3, 2) },
+      { sessionsRoot: sandbox.sessionsRoot, backupDir }
+    )
+
+    const after = await readFile(logPath)
+    assert.ok(after.length > before.length, '文件应该变长')
+    assert.equal(
+      Buffer.compare(after.subarray(0, before.length), before),
+      0,
+      '原文件必须是新文件的前缀 —— 这就是 append-only'
+    )
+  } finally {
+    await sandbox.cleanup()
+  }
+})
+
+test('appendToSession：首 seq 与本机 nextSeq 不符必须拒绝（gap/重放）', async (t) => {
+  if (!hasNativeZstd) {
+    t.diagnostic('无原生 zstd 压缩，跳过')
+    return
+  }
+  const sandbox = await makeSandbox()
+  try {
+    const backupDir = join(sandbox.home, 'backups')
+    const payload = makePayload('append-gap', { events: 4 })
+    const first = await writeSession(payload, { sessionsRoot: sandbox.sessionsRoot, backupDir })
+    const logPath = join(first.sessionDir, currentLogFilename())
+    const before = await readFile(logPath)
+
+    // gap：从 seq 6 开始，但本机 nextSeq 是 4
+    await assert.rejects(
+      () =>
+        appendToSession(
+          { sessionId: payload.sessionId, header: payload.header, events: makeAppendEvents(6, 2) },
+          { sessionsRoot: sandbox.sessionsRoot, backupDir }
+        ),
+      (err) => err.code === 'conflict-session'
+    )
+
+    // 重放：从 seq 0 开始，本机已经有了
+    await assert.rejects(
+      () =>
+        appendToSession(
+          { sessionId: payload.sessionId, header: payload.header, events: makeAppendEvents(0, 2) },
+          { sessionsRoot: sandbox.sessionsRoot, backupDir }
+        ),
+      (err) => err.code === 'conflict-session'
+    )
+
+    // 两次拒绝都必须让文件一字节未变
+    assert.equal(Buffer.compare(await readFile(logPath), before), 0)
+  } finally {
+    await sandbox.cleanup()
+  }
+})
+
+test('appendToSession：自动截掉 torn tail 后再追加', async (t) => {
+  if (!hasNativeZstd) {
+    t.diagnostic('无原生 zstd 压缩，跳过')
+    return
+  }
+  const sandbox = await makeSandbox()
+  try {
+    const backupDir = join(sandbox.home, 'backups')
+    const payload = makePayload('append-torn', { events: 3 })
+    const first = await writeSession(payload, { sessionsRoot: sandbox.sessionsRoot, backupDir })
+    const logPath = join(first.sessionDir, currentLogFilename())
+
+    // 模拟崩溃：把文件末尾截断成半个帧。
+    // 原文件 3 个事件各一帧，截掉 7 字节会破坏最后一帧（seq=2 那条）。
+    const full = await readFile(logPath)
+    await writeFile(logPath, full.subarray(0, full.length - 7))
+
+    // 截断后的「完整事件前缀」只剩 seq 0..1，所以本机 nextSeq = 2。
+    // 这里有一个必须讲清楚的语义：丢弃 torn tail 之后，**那条事件就等于没写成功**，
+    // 因此正确的追加起点是 seq=2（把它重写一遍），而**不是** seq=3。
+    // 若从 seq=3 追加就会留下 seq 缺口 —— 实现会拒绝，这是对的。
+    await assert.rejects(
+      () =>
+        appendToSession(
+          { sessionId: payload.sessionId, header: payload.header, events: makeAppendEvents(3, 2) },
+          { sessionsRoot: sandbox.sessionsRoot, backupDir }
+        ),
+      (err) => err.code === 'conflict-session',
+      'torn tail 丢弃后若从 seq=3 追加会留下缺口，必须拒绝'
+    )
+
+    // 正确做法：从 seq=2 重新开始追加（重放被截断掉的那条 + 新增一条）
+    const result = await appendToSession(
+      { sessionId: payload.sessionId, header: payload.header, events: makeAppendEvents(2, 2) },
+      { sessionsRoot: sandbox.sessionsRoot, backupDir }
+    )
+
+    assert.ok(result.truncatedTailBytes > 0, '应识别并截掉 torn tail')
+    assert.equal(result.nextSeq, 4, '完整前缀 2 条 + 追加 2 条')
+    // 追加后半帧被清掉，整个文件必须能正常解码
+    const record = await readSessionDir(first.sessionDir)
+    assert.equal(record.nextSeq, 4)
+    assert.equal(record.tornTail, false, '追加后不应再有 torn tail')
+  } finally {
+    await sandbox.cleanup()
+  }
+})
+
+test('appendToSession：会话不存在时明确拒绝（应走 write 而非 append）', async () => {
+  const sandbox = await makeSandbox()
+  try {
+    const payload = makePayload('append-missing', { events: 2 })
+    await assert.rejects(
+      () =>
+        appendToSession(payload, {
+          sessionsRoot: sandbox.sessionsRoot,
+          backupDir: join(sandbox.home, 'backups'),
+        }),
+      (err) => err.code === 'repo-path-missing'
+    )
+  } finally {
+    await sandbox.cleanup()
+  }
+})
+
+test('appendToSession：LIVE 会话拒绝追加', async (t) => {
+  if (!hasNativeZstd) {
+    t.diagnostic('无原生 zstd 压缩，跳过')
+    return
+  }
+  const sandbox = await makeSandbox()
+  try {
+    const backupDir = join(sandbox.home, 'backups')
+    const payload = makePayload('append-live', { events: 3 })
+    const first = await writeSession(payload, { sessionsRoot: sandbox.sessionsRoot, backupDir })
+    await writeFile(join(first.sessionDir, 'session.lock'), '')
+    const before = await readFile(join(first.sessionDir, currentLogFilename()))
+
+    await assert.rejects(
+      () =>
+        appendToSession(
+          { sessionId: payload.sessionId, header: payload.header, events: makeAppendEvents(3, 1) },
+          {
+            sessionsRoot: sandbox.sessionsRoot,
+            backupDir,
+            lockProbeRunner: async () => ({
+              available: true,
+              code: 0,
+              stdout: 'COMMAND PID USER\nnode 1 gzp\n',
+              stderr: '',
+            }),
+          }
+        ),
+      (err) => err.code === 'busy'
+    )
+
+    assert.equal(Buffer.compare(await readFile(join(first.sessionDir, currentLogFilename())), before), 0)
+  } finally {
+    await sandbox.cleanup()
+  }
+})
+
+test('appendToSession：dryRun 不写任何字节', async (t) => {
+  if (!hasNativeZstd) {
+    t.diagnostic('无原生 zstd 压缩，跳过')
+    return
+  }
+  const sandbox = await makeSandbox()
+  try {
+    const backupDir = join(sandbox.home, 'backups')
+    const payload = makePayload('append-dry', { events: 3 })
+    const first = await writeSession(payload, { sessionsRoot: sandbox.sessionsRoot, backupDir })
+    const logPath = join(first.sessionDir, currentLogFilename())
+    const before = await readFile(logPath)
+
+    const result = await appendToSession(
+      { sessionId: payload.sessionId, header: payload.header, events: makeAppendEvents(3, 2) },
+      { sessionsRoot: sandbox.sessionsRoot, backupDir, dryRun: true }
+    )
+
+    assert.equal(result.dryRun, true)
+    assert.equal(result.appended, 2)
+    assert.equal(result.backupPath, null)
+    assert.equal(result.nextSeq, 5)
+    assert.equal(Buffer.compare(await readFile(logPath), before), 0, 'dry-run 不得写任何字节')
+  } finally {
+    await sandbox.cleanup()
+  }
+})
+
+// ─────────────────────────────────────────────────────────────
+// 幂等性：多次跨机往返后结构不持续膨胀
+// ─────────────────────────────────────────────────────────────
+
+test('往返幂等：A→B→A 重写 cwd 后帧数与事件数不增长', async (t) => {
+  if (!hasNativeZstd) {
+    t.diagnostic('无原生 zstd 压缩，跳过')
+    return
+  }
+  const sandbox = await makeSandbox()
+  try {
+    const backupDir = join(sandbox.home, 'backups')
+    const cwdA = '/tmp/dsh-sandbox/machine-a/repo'
+    const cwdB = '/tmp/dsh-sandbox/machine-b/work/repo'
+
+    // A 机原始会话
+    const payloadA = makePayload('idem', { cwd: cwdA, events: 6 })
+    const first = await writeSession(payloadA, {
+      sessionsRoot: sandbox.sessionsRoot,
+      backupDir,
+    })
+    const recordA = await readSessionDir(first.sessionDir)
+    const framesA = recordA.frames
+    const eventsA = recordA.nextSeq
+
+    // B 机：重写 cwd 到 B 的路径
+    const recordARaw = await readSessionDir(first.sessionDir)
+    const wroteB = await writeSession(
+      {
+        sessionId: payloadA.sessionId,
+        header: recordARaw.header,
+        events: recordARaw.events,
+      },
+      { sessionsRoot: sandbox.sessionsRoot, backupDir, cwdOverride: cwdB }
+    )
+    const recordB = await readSessionDir(wroteB.sessionDir)
+
+    // A 机：再重写回 A 的路径（模拟会话从 B 回到 A）
+    const wroteA2 = await writeSession(
+      { sessionId: payloadA.sessionId, header: recordB.header, events: recordB.events },
+      { sessionsRoot: sandbox.sessionsRoot, backupDir, cwdOverride: cwdA }
+    )
+    const recordA2 = await readSessionDir(wroteA2.sessionDir)
+
+    // 核心断言：结构稳定，不因往返而膨胀
+    assert.equal(recordA2.nextSeq, eventsA, '事件数必须与最初相同')
+    assert.equal(recordA2.frames, framesA, '帧数必须与最初相同（不得逐次增长）')
+    assert.equal(recordA2.header.cwd, cwdA, 'cwd 应回到 A 机路径')
+    assert.equal(recordB.header.cwd, cwdB)
+    // 连续两次写同样的内容，帧数不应变化
+    const repeat = await writeSession(
+      { sessionId: payloadA.sessionId, header: recordA2.header, events: recordA2.events },
+      { sessionsRoot: sandbox.sessionsRoot, backupDir, cwdOverride: cwdA }
+    )
+    const recordRepeat = await readSessionDir(repeat.sessionDir)
+    assert.equal(recordRepeat.frames, recordA2.frames, '重复写入不得让帧数变化')
+    assert.equal(recordRepeat.nextSeq, recordA2.nextSeq)
+  } finally {
+    await sandbox.cleanup()
+  }
 })

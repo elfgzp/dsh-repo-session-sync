@@ -27,7 +27,7 @@
 
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { join, resolve, sep } from 'node:path'
 import zlib from 'node:zlib'
 
@@ -1727,6 +1727,9 @@ export async function writeSession(payload, options) {
       written: [],
       skipped: [],
       backupPath: wouldBackup,
+      sessionDir,
+      logFile,
+      sessionLockPath: join(sessionDir, LOCK_FILENAME),
       wouldWrite: logFile,
       wouldOverwrite: existed,
       sessionId,
@@ -1798,7 +1801,219 @@ export async function writeSession(payload, options) {
     skipped: [],
     backupPath,
     sessionId,
+    // 结构化位置信息：回滚、附件写入、以及「这个会话会不会被 DSH 收录」
+    // 的判断都需要这些路径。显式返回，避免调用方用 dirname(written[0])
+    // 这种脆弱推算（written 将来可能变成多文件）。
+    sessionDir,
+    logFile,
+    sessionLockPath: join(sessionDir, LOCK_FILENAME),
     contentHash,
+    eventCount: events.length,
+    dryRun: false,
+  }
+}
+
+/**
+ * 把一个会话的**增量**事件追加到已有日志末尾。
+ *
+ * ## 为什么必须支持追加而不是整文件重写
+ *
+ * 这是设计里的红线，三条理由：
+ *
+ *   1. **append-only 是 DSH 的契约**。官方 `append` 要求「首批 seq 必须等于
+ *      已存的 next-seq，gap 直接拒绝」。我们照做就等于复用了 DSH 自己的
+ *      不变量校验。
+ *   2. **崩溃安全**。整文件重写在写一半时崩溃会丢掉整个会话；追加最坏只丢
+ *      半帧，而半帧本来就是 DSH 认识的 torn tail，读取时会自动丢弃。
+ *   3. **效率**。10MB 的会话每次同步都重写一遍是不可接受的。
+ *
+ * ## 实现要点
+ *
+ *   - 新事件先编码成**独立的 zstd 帧**，然后整体追加到文件末尾。
+ *     DSH 的文件格式就是「帧拼接」，所以追加帧 == 追加新的一批事件，
+ *     与 DSH 自己落盘的方式完全一致。
+ *   - 追加前校验 `firstSeq === 本机 nextSeq`，不相等就拒绝（gap 或重放）。
+ *   - 追加后 `fsync`，确保落盘后才报成功。
+ *   - 追加后回读验证：事件数必须等于追加后的期望值。
+ *
+ * ## 与 torn tail 的关系
+ *
+ * 如果现有文件末尾有半帧（上次崩溃留下的），**追加前必须先把它截掉**，
+ * 否则新帧会接在半个帧后面，整个文件变成无法解码的垃圾。
+ * 这里用 `scanZstdFrames` 找到最后一个完整帧的末尾作为安全追加位置。
+ *
+ * @param {object} payload `{sessionId, header, events}` —— events 是**要追加的新事件**
+ * @param {{sessionsRoot: string, backupDir: string, cwdOverride?: string,
+ *          lockProbeRunner?: Function, skipLiveCheck?: boolean, dryRun?: boolean}} options
+ * @returns {Promise<{appended: number, appendedBytes: number, backupPath: string|null,
+ *                    sessionId: string, sessionDir: string, nextSeq: number,
+ *                    truncatedTailBytes: number, dryRun: boolean}>}
+ */
+export async function appendToSession(payload, options) {
+  const { sessionsRoot, backupDir, cwdOverride, dryRun = false } = options ?? {}
+  if (typeof sessionsRoot !== 'string' || sessionsRoot === '') {
+    throw new SyncError(ERROR_CODES.BAD_REQUEST, 'appendToSession 需要 sessionsRoot。')
+  }
+  if (typeof backupDir !== 'string' || backupDir === '') {
+    throw new SyncError(ERROR_CODES.BACKUP_FAILED, 'appendToSession 需要 backupDir —— 无备份不写入。', {
+      hint: '追加前同样会备份，以便回滚。',
+    })
+  }
+
+  const sessionId = assertSafeSessionId(payload?.sessionId, '待追加 sessionId')
+  assertNotCredentialPath(sessionsRoot)
+  assertNotCredentialPath(backupDir)
+
+  const header = payload?.header
+  const newEvents = payload?.events
+  if (!Array.isArray(newEvents) || newEvents.length === 0) {
+    throw new SyncError(ERROR_CODES.BAD_REQUEST, `会话 ${sessionId} 没有要追加的事件。`)
+  }
+
+  const effectiveCwd =
+    typeof cwdOverride === 'string' && cwdOverride !== '' ? cwdOverride : header?.cwd
+  if (typeof effectiveCwd !== 'string' || effectiveCwd === '') {
+    throw new SyncError(ERROR_CODES.CORRUPT_SESSION, `会话 ${sessionId} 没有 cwd，无法定位。`)
+  }
+
+  const dir = join(resolve(sessionsRoot), projectKey(effectiveCwd), encodeSegment(sessionId))
+  assertInside(resolve(sessionsRoot), dir)
+  const logFile = join(dir, currentLogFilename(true))
+
+  if (!(await pathExists(logFile))) {
+    throw new SyncError(
+      ERROR_CODES.REPO_PATH_MISSING,
+      `会话 ${sessionId} 在本机不存在，无法追加；应改用 writeSession 整体写入。`,
+      { hint: '这通常意味着引擎的增量判定与本机状态不一致。' }
+    )
+  }
+
+  // ── LIVE 检查：绝不给运行中的会话追加 ──
+  if (options.skipLiveCheck !== true) {
+    const liveness = await isSessionLive(dir, { execFile: options.lockProbeRunner })
+    if (liveness.live) {
+      if (dryRun) {
+        return {
+          appended: 0,
+          appendedBytes: 0,
+          backupPath: null,
+          sessionId,
+          sessionDir: dir,
+          nextSeq: null,
+          truncatedTailBytes: 0,
+          live: true,
+          liveReason: liveness.reason ?? null,
+          dryRun: true,
+        }
+      }
+      throw new SyncError(
+        ERROR_CODES.BUSY,
+        `会话 ${sessionId} 正在使用中，已跳过追加以免破坏 DSH 的内存状态。`,
+        {
+          hint: '请先在 DSH 里结束或关闭该会话，再重新同步。',
+          detail: { method: liveness.method, reason: liveness.reason },
+        }
+      )
+    }
+  }
+
+  // ── 读现有文件，确定安全追加位置与本机 nextSeq ──
+  const existing = await readSessionDir(dir, { frameDecoder: options.frameDecoder })
+  if (existing.id !== sessionId) {
+    throw new SyncError(
+      ERROR_CODES.CORRUPT_SESSION,
+      `磁盘上的会话 id（${existing.id}）与要追加的 ${sessionId} 不一致。`
+    )
+  }
+
+  const firstSeq = newEvents[0]?.seq
+  if (firstSeq !== existing.nextSeq) {
+    throw new SyncError(
+      ERROR_CODES.CONFLICT_SESSION,
+      `追加起点不对：本机 nextSeq=${existing.nextSeq}，要追加的首个 seq=${firstSeq}。`,
+      {
+        hint:
+          firstSeq > existing.nextSeq
+            ? '远端缺少中间事件，包不完整；请重新上行完整包。'
+            : '这些事件本机已经有了，可能重复同步。',
+        detail: { localNextSeq: existing.nextSeq, incomingFirstSeq: firstSeq },
+      }
+    )
+  }
+  // 追加的 seq 自身也必须连续
+  for (let i = 0; i < newEvents.length; i++) {
+    if (newEvents[i]?.seq !== firstSeq + i) {
+      throw new SyncError(
+        ERROR_CODES.CORRUPT_SESSION,
+        `追加事件 seq 不连续：第 ${i} 个期望 ${firstSeq + i}，实际 ${newEvents[i]?.seq}。`
+      )
+    }
+  }
+
+  const raw = await readFile(logFile)
+  const { frames, tornStart } = scanZstdFrames(raw)
+  const safeAppendAt = frames.length > 0 ? frames[frames.length - 1].end : 0
+  const truncatedTailBytes = raw.length - safeAppendAt
+
+  // ── 编码新帧 ──
+  const encodeFrame = options.frameEncoder ?? defaultFrameEncoder
+  const appendedFrames = newEvents.map((event) =>
+    encodeFrame(Buffer.from(JSON.stringify(event) + '\n', 'utf8'))
+  )
+  const appendedBytes = Buffer.concat(appendedFrames)
+
+  if (dryRun) {
+    return {
+      appended: newEvents.length,
+      appendedBytes: appendedBytes.length,
+      backupPath: null,
+      sessionId,
+      sessionDir: dir,
+      nextSeq: existing.nextSeq + newEvents.length,
+      truncatedTailBytes,
+      wouldWrite: logFile,
+      dryRun: true,
+    }
+  }
+
+  // ── 备份（追加同样要能回滚）──
+  const backupPath = await snapshotSessionDir(dir, backupDir, sessionId)
+
+  // ── 追加：截掉 torn tail → 写新帧 → fsync ──
+  const handle = await open(logFile, 'r+')
+  try {
+    if (truncatedTailBytes > 0) {
+      // 上次崩溃留下的半帧必须先去掉，否则新帧接在半帧后面会让整个文件报废
+      await handle.truncate(safeAppendAt)
+    }
+    await handle.write(appendedBytes, 0, appendedBytes.length, safeAppendAt)
+    // 落盘后才算成功：append 的语义是「返回即持久」
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+
+  // ── 回读验证 ──
+  const verified = await readSessionDir(dir, { frameDecoder: options.frameDecoder })
+  const expected = existing.nextSeq + newEvents.length
+  if (verified.nextSeq !== expected) {
+    throw new SyncError(
+      ERROR_CODES.CORRUPT_SESSION,
+      `追加后校验失败：期望 ${expected} 个事件，读回 ${verified.nextSeq} 个。`,
+      { hint: `原文件已备份到 ${backupPath}，可据此恢复。` }
+    )
+  }
+
+  return {
+    appended: newEvents.length,
+    appendedBytes: appendedBytes.length,
+    backupPath,
+    sessionId,
+    sessionDir: dir,
+    logFile,
+    sessionLockPath: join(dir, LOCK_FILENAME),
+    nextSeq: verified.nextSeq,
+    truncatedTailBytes,
     dryRun: false,
   }
 }
