@@ -1051,3 +1051,63 @@ pull() 的成功标准 = 会话出现在 DSH 的可见集合中
 
 - [`docs/session-format.md`](./session-format.md) — 存储格式、帧结构、水位线、并发安全
 - 实现若发现本设计不可行，**先停下在群里报**，不要自行改设计。
+
+---
+
+## 附录 B：设计 ↔ 实现 一致性审计（可重复执行）
+
+设计文档最大的风险不是写错，而是**写完就与实现脱节**——读者按文档理解系统，
+行为却与代码不符。本附录给出**可重复执行**的核对脚本思路，
+目的不是"审计一次"，而是**随时能被重跑**。
+
+### B.1 审计原则
+
+每条 ADR 都转成一个**可证伪的断言**，直接调用真实实现验证，而不是读代码"看像不像"。
+判定标准：**如果实现违反了这条 ADR，断言必须失败。**
+
+### B.2 已核对的 12 条（全部通过）
+
+| ID | 断言内容 | 验证方式 |
+|---|---|---|
+| ADR-1 | `repoKey` 不含分支 | 同 remote、不同 branch → 返回值相等 |
+| ADR-3 | 水位线双层存在 | 代码同时出现 seq 与字节偏移语义 |
+| ADR-4 | ref 在 `refs/dsh-sessions/` 下 | 直接读 transport 源 |
+| ADR-4 | 不存在 `checkout` 调用 | 去注释后正则扫描 |
+| ADR-6 | 两端分叉不返回 `remote-wins` | 构造分叉输入调 `decideConflict` |
+| ADR-9 | public → 需确认 | 注入 stub `runGh` 返回 PUBLIC |
+| ADR-9 | 判定失败不默认放行 | `runGh` 与 `fetchJson` 双双抛错 |
+| ADR-11 | 注释明确声明跨机去重**不成立** | 扫描注释文本 |
+| ADR-13 | registry 缺失时硬失败 | 代码存在 `REGISTRY_UNAVAILABLE` |
+| ADR-14 | 回滚按 `created` 分流 | 代码存在 `createdFailed` / `appendedFailed` |
+| G2b | `writeSession` 创建 `session.lock` | 真实写入后 `readdir` |
+| FMT-2 | `projectKey` 含 `~XXXX` 转义 | 中文 / 空格路径实测 |
+
+### B.3 两条审计过程中被证伪、随后已修复的结论
+
+保留记录，因为它们说明**"文档写了"不等于"实现做了"**：
+
+1. **ADR-1**：早期 `repoKeyOf()` 返回 `remote + "\0" + branch`，且 JSDoc 也这么写。
+   **代码注释与设计文档矛盾时，实现者会照注释写。** 已修复，并把注释一并改正。
+2. **ADR-15（新增）**：`writeSession` 早期**不创建 `session.lock`**，
+   而 `isSessionLive()` 在锁文件缺失时直接短路返回 `not-live`——
+   **插件自己创建的会话，LIVE 检测永久失效**，可能写入正在被 DSH 使用的会话。
+   已修复（创建会话时一并创建空 lock，与 DSH 原生目录结构对齐）。
+
+> **审计自身的教训**：核对脚本本身也会有 bug。
+> 本次审计曾误报 ADR-11「违规」——原因是我的正则去匹配"跨机去重成立"，
+> 而代码注释写的是"跨机去重**不**成立"（正是 ADR-11 要求的）。
+> **断言写错会误报，和实现写错一样需要验证**——这与此前 C1 假 RED、G1 假红是同类问题。
+
+### B.4 如何重跑
+
+审计脚本不进入仓库（它依赖本机模块路径），但方法可复用：
+
+```js
+// 对每条 ADR：import 真实模块 -> 构造触发条件 -> 断言行为
+const rb = await import('./src/repo-binding.js')
+const a = rb.repoKeyOf({ remoteUrl: 'git@github.com:d/r.git', branch: 'main' })
+const b = rb.repoKeyOf({ remoteUrl: 'git@github.com:d/r.git', branch: 'feat' })
+console.assert(a === b, 'ADR-1: repoKey must not contain branch')
+```
+
+**建议每次改动 `src/` 后重跑一遍**——它比"文档 review"便宜，比"发现问题时才发现文档过时"便宜得多。
