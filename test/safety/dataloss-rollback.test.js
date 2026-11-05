@@ -299,17 +299,50 @@ test('structure: a session written by the plugin has the same layout as a real D
     return;
   }
 
+  // `writeSession` needs a zstd frame encoder. Node < 22.15 has no native
+  // compressor, so instead of skipping (a skip verifies nothing) we inject our
+  // own zero-dependency encoder. The frames it emits are valid zstd — the shape
+  // of the directory is what this test is about, not the compression ratio.
+  const zlib = await import('node:zlib');
+  const { encodeFrame } = await import('../lib/zstd-frame.mjs');
+  const frameEncoder =
+    typeof zlib.default.zstdCompressSync === 'function'
+      ? undefined // let the implementation use its native default
+      : (buf) => encodeFrame(buf);
+
   const dir = tempDir(t);
   const home = makeTempDshHome(dir);
   t.after(() => home.dispose());
 
+  // Use the explicit form (payload + options) rather than the convenience form:
+  // the convenience form does not forward `frameEncoder`, so on a runtime without
+  // native zstd it would fail before reaching the behaviour under test.
   const sessionId = fixtureSessionId(41);
-  const written = await store.writeSession({
-    dshHome: home.root,
-    sessionId,
+  const header = {
+    type: 'session',
+    version: 4,
+    id: sessionId,
+    createdAt: 1700000000000,
     cwd: '/tmp/qa-fixture/repo-a',
-    rounds: 2,
-  });
+    isSeeded: false,
+    delegationDepth: 0,
+    agentPreset: 'cordis',
+  };
+  /** One round = user + assistant message. seq must be contiguous from 0. */
+  const events = [
+    { type: 'user/message', seq: 0, time: 1700000000001, data: { turn: 1, step: 1, message: { role: 'user', content: [{ type: 'text', text: 'hello' }] } } },
+    { type: 'assistant/message', seq: 1, time: 1700000000002, data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'hi' }] } } },
+  ];
+  const written = await store.writeSession(
+    { sessionId, header, events },
+    {
+      sessionsRoot: join(home.root, 'sessions'),
+      backupDir: join(home.root, 'repo-session-sync', 'backups'),
+      cwdOverride: '/tmp/qa-fixture/repo-a',
+      skipLiveCheck: true,
+      frameEncoder,
+    },
+  );
 
   const files = readdirSync(written.sessionDir).sort();
   assert.ok(
