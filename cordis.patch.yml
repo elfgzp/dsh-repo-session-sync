@@ -1,0 +1,6 @@
+# dsh-repo-session-sync — profile bundle patch.
+# Registered by `dsh plugin add dsh-repo-session-sync`; the loader merges this
+# patch layer over the profile root. Keep this file minimal: it only mounts the
+# plugin, all behaviour is configured from the Settings page / config schema.
+- id: repo-session-sync
+  name: dsh-repo-session-sync

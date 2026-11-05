@@ -1,0 +1,16 @@
+{
+  "name": "dsh-repo-session-sync",
+  "version": "0.0.1",
+  "description": "Sync DeepSeek Harness sessions with git repositories across machines: code travels by git, conversation state travels with it. 把 DSH 会话与 git 仓库绑定，在多机之间同步会话状态——代码走 git，对话跟着走。",
+  "type": "module",
+  "main": "src/index.js",
+  "files": ["src", "cordis.patch.yml", "README.md", "LICENSE"],
+  "keywords": ["dsh-plugin", "deepseek-harness", "session-sync", "git"],
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=22.19"
+  }
+}
