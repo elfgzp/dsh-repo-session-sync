@@ -31,7 +31,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -275,4 +275,61 @@ test('dataloss: rollback routing separates created from appended sessions', asyn
     new RegExp(`rollbackNewSessions\\s*\\([^)]*\\b${appendedName}\\b`),
     'appended sessions must never be passed to the delete-based rollback',
   );
+});
+
+test('structure: a session written by the plugin has the same layout as a real DSH session', async (t) => {
+  // WHY THIS EXISTS
+  // `isSessionLive()` short-circuits to "not live" when `session.lock` is absent:
+  //
+  //     if (!(await pathExists(lockFile))) return { live: false, checked: true,
+  //                                                 method: 'no-lock-file' }
+  //
+  // So if the plugin ever produced session directories WITHOUT a lock file, LIVE
+  // detection would silently return "not live" forever for every session the
+  // plugin itself created — and a downward sync would happily overwrite a session
+  // the user currently has open in DSH. That is precisely the failure LIVE
+  // detection exists to prevent, reached by a structural mismatch rather than a
+  // logic bug.
+  //
+  // Structural consistency is cheap to assert and does not depend on behaviour,
+  // so it is checked here as a standing invariant.
+  const store = await load('session-store.js');
+  if (!store || typeof store.writeSession !== 'function') {
+    t.skip('session-store.writeSession not available');
+    return;
+  }
+
+  const dir = tempDir(t);
+  const home = makeTempDshHome(dir);
+  t.after(() => home.dispose());
+
+  const sessionId = fixtureSessionId(41);
+  const written = await store.writeSession({
+    dshHome: home.root,
+    sessionId,
+    cwd: '/tmp/qa-fixture/repo-a',
+    rounds: 2,
+  });
+
+  const files = readdirSync(written.sessionDir).sort();
+  assert.ok(
+    files.includes('session.v4.jsonl.zstd'),
+    `expected the session log, got: ${files.join(', ')}`,
+  );
+  assert.ok(
+    files.includes('session.lock'),
+    'a plugin-written session MUST contain session.lock, otherwise isSessionLive() short-circuits ' +
+      'to "not live" for every session we create and LIVE protection never engages. ' +
+      `Got: ${files.join(', ')}`,
+  );
+
+  // The lock must be empty (it is a flock anchor, not a payload).
+  assert.equal(readFileSync(join(written.sessionDir, 'session.lock')).length, 0);
+
+  // And it must not be pre-locked: acquiring the lock is DSH's job, not ours.
+  // A held lock would block the real writer.
+  const verdict = await store.isSessionLive?.(written.sessionDir);
+  if (verdict) {
+    assert.equal(verdict.live, false, 'a freshly written session must not report as LIVE');
+  }
 });
