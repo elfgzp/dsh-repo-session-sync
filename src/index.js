@@ -215,7 +215,7 @@ function failure(error) {
 function promptText() {
   return `## Repository session sync
 
-This machine can synchronize DeepSeek Harness conversations across machines through \`${TOOL_NAME}\`, keyed by Git repository identity (remote URL + branch), not by filesystem path.
+This machine can synchronize DeepSeek Harness conversations across machines through \`${TOOL_NAME}\`, keyed by Git repository identity (the remote URL), not by filesystem path or current branch.
 
 - Call \`${TOOL_NAME}\` with \`action: "status"\` to see bound repositories and their last sync state.
 - \`action: "up"\` uploads this machine's sessions for a repository; \`action: "down"\` downloads them; \`action: "both"\` reconciles.
@@ -490,7 +490,7 @@ export function apply(ctx, rawConfig) {
     const dispose = toolsService.register({
       name: TOOL_NAME,
       description:
-        'Synchronize DeepSeek Harness conversations across machines, keyed by Git repository (remote URL + branch). '
+        'Synchronize DeepSeek Harness conversations across machines, keyed by Git repository identity (the remote URL). '
         + 'Use action="status" to inspect bindings; "bind" to bind a repository path; "up" to upload this machine\'s '
         + 'sessions; "down" to download remote sessions; "both" to reconcile. '
         + 'Pass dryRun=true to preview. A non-dry-run down/both can replace local session logs, so only run one when '
@@ -518,7 +518,7 @@ export function apply(ctx, rawConfig) {
           },
           branch: {
             type: 'string',
-            description: 'Branch identity used in the sync key. Defaults to HEAD.',
+            description: 'Branch the sessions are associated with. Display only — it is not part of the sync key.',
           },
           direction: {
             type: 'string',

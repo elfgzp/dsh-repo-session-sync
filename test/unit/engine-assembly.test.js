@@ -159,6 +159,10 @@ async function makeEngine(options) {
         }
       },
       classifyIncoming(local, remote) {
+        if (typeof options.classifyIncomingImpl === 'function') {
+          return options.classifyIncomingImpl(local, remote)
+        }
+        if (remote.toSeqExclusive < remote.fromSeq) return { action: 'up-to-date', reason: 'local-ahead' }
         if (remote.toSeqExclusive <= local.nextSeq) return { action: 'up-to-date', reason: 'covered' }
         if (remote.fromSeq === local.nextSeq) return { action: 'append', reason: 'contiguous' }
         return { action: 'gap', reason: 'hole' }
@@ -651,5 +655,54 @@ test('down：两端分叉 → 走冲突，不覆盖', async () => {
     assert.equal(result.conflicts[0].kind, 'keep-both')
     // Nothing was written for the conflicting session.
     assert.equal(result.transferred, 0)
+  })
+})
+
+test('down：本机领先远端 → 跳过（等下次上行），不能报成 gap 假冲突', async () => {
+  await withScenario(async ({ dir, binding, store }) => {
+    // The local session already has 5 events; the remote bundle only carries 3.
+    // Nothing about that is a conflict — the local copy is simply ahead. Treating
+    // it as a gap produced a spurious conflict on every download after an upload
+    // that had not yet been pulled by the other machine.
+    const { engine } = await makeEngine({
+      dir,
+      binding,
+      store,
+      remoteSessions: [
+        {
+          sessionId: 'sess-ahead',
+          eventCount: 3,
+          content: Buffer.from('a'),
+          events: [{ seq: 0 }, { seq: 1 }, { seq: 2 }],
+        },
+      ],
+      localList: [{ sessionId: 'sess-ahead', cwd: dir }],
+      localRead: () => ({
+        sessionId: 'sess-ahead',
+        eventCount: 5,
+        header: { type: 'session', id: 'sess-ahead', cwd: dir },
+        events: [{ seq: 0 }, { seq: 1 }, { seq: 2 }, { seq: 3 }, { seq: 4 }],
+      }),
+      decide: () => ({ kind: 'no-conflict', reason: 'clean' }),
+      registryOutcome: { attached: [] },
+      // Reproduce the PRE-FIX contract, where an inverted interval meant "gap".
+      // The engine must decide the direction itself rather than depend on the
+      // downstream defensive branch — otherwise a regression in that branch turns
+      // every ordinary "I uploaded, you have not pulled yet" into a fake conflict.
+      classifyIncomingImpl: (local, remote) => {
+        if (remote.toSeqExclusive < remote.fromSeq) {
+          return { action: 'gap', reason: '远端区间倒置' }
+        }
+        if (remote.toSeqExclusive <= local.nextSeq) return { action: 'up-to-date', reason: 'covered' }
+        if (remote.fromSeq === local.nextSeq) return { action: 'append', reason: 'contiguous' }
+        return { action: 'gap', reason: 'hole' }
+      },
+    })
+
+    const result = await engine.down({ repoId: binding.id })
+
+    assert.equal(result.ok, true, '本机领先是正常状态，不该失败')
+    assert.equal(result.conflicts.length, 0, '本机领先不能被报成冲突')
+    assert.equal(result.transferred, 0, '本机更全，不需要写入')
   })
 })

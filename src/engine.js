@@ -1102,6 +1102,19 @@ export function createSyncEngine(dependencies, meta = {}) {
     const kind = decision?.kind ?? 'no-conflict'
 
     if (kind === 'no-conflict') {
+      // Local ahead of remote is a NORMAL state, not a conflict: this machine
+      // uploaded, and the other machine has not pulled yet. `classifyIncoming`
+      // now handles the inverted interval, but deciding the direction here keeps
+      // the engine from depending on that defensive branch — and states the
+      // intent at the call site, where the next reader looks.
+      if (Number(remote.eventCount) < Number(local.eventCount)) {
+        return { kind: 'skipped', reason: 'local-ahead' }
+      }
+
+      // `fromSeq` describes where the REMOTE's new span begins, which is exactly
+      // the number of events the local file already holds. Passing anything else
+      // (a stored watermark, the remote's own start) makes contiguous appends look
+      // like gaps.
       const verdict = sessionOps.classifyIncoming(
         { nextSeq: local.eventCount },
         { fromSeq: local.eventCount, toSeqExclusive: remote.eventCount },

@@ -9,9 +9,15 @@
  *
  * So the key is:
  *
- *     repoKey = canonicalRemoteUrl + "\u0000" + branch
+ *     repoKey = canonicalRemoteUrl
  *
- * and the local path is just an attribute of a binding, not part of its
+ * The branch is deliberately **not** part of it (ADR-1). Including it made one
+ * repository produce a different key per checked-out branch, so the same clone
+ * seen on `main` and on `feature-x` became two bindings in the UI and two
+ * independent sync histories. Branch is now a display attribute, like the local
+ * path: useful to show, never part of "which repository is this?".
+ *
+ * The local path is likewise just an attribute of a binding, not part of its
  * identity. That is what makes "same repo on two machines" expressible.
  *
  * @module dsh-repo-session-sync/repo-binding
@@ -185,12 +191,8 @@ function decodeURIComponentSafe(value) {
 export function repoKeyOf(binding) {
   const remote = canonicalizeRemoteUrl(binding?.remoteUrl)
   if (remote === undefined) return undefined
-  const branch = typeof binding?.branch === 'string' && binding.branch.trim() !== ''
-    ? binding.branch.trim()
-    : 'HEAD'
-  // A separator that cannot appear in either part, so `a/b` + `c` and `a` + `b/c`
-  // never collide.
-  return `${remote.canonical}\u0000${branch}`
+  // Branch is intentionally absent: see the module header and ADR-1.
+  return remote.canonical
 }
 
 /**
@@ -264,6 +266,9 @@ export function normalizeRepoPath(repoPath) {
  * @returns {string} Safe id such as `repo-1a2b3c4d`.
  */
 export function deriveRepoId(repoKey) {
+  // `split('\u0000')` is defensive: keys written before ADR-1 carried a branch
+  // suffix. Nothing produces that shape any more, but an imported legacy table
+  // should still derive a readable prefix instead of throwing.
   const readable = String(repoKey ?? '')
     .split('\u0000')[0]
     .replace(/[^a-zA-Z0-9]+/g, '-')
@@ -371,7 +376,7 @@ export function createBinding(input = {}, options = {}) {
   }
 
   const branch = String(input.branch ?? existing?.branch ?? 'HEAD').trim() || 'HEAD'
-  const repoKey = `${canonical.canonical}\u0000${branch}`
+  const repoKey = canonical.canonical
 
   const repoId = typeof input.id === 'string' && isSafeSegment(input.id)
     ? input.id
