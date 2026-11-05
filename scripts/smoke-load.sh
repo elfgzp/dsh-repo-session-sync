@@ -296,6 +296,32 @@ $ACTIVATION_CHECK
 EOF
 
 # ---------------------------------------------------------------------------
+# 4b. Client half: inlined source freshness + real render
+# ---------------------------------------------------------------------------
+step "4b. client 半边（生成区块一致性 + 真实渲染）"
+
+BUILD_CHECK="$("$NODE_BIN" "$REPO_ROOT/scripts/build-client.mjs" --check 2>&1)"
+if [ $? -eq 0 ]; then
+  pass "client.js 的 UI 区块与 src/ui/settings-page.js 一致"
+else
+  fail "client.js 的 UI 区块已漂移 —— 运行 npm run build:client 重新生成"
+  printf '%s\n' "$BUILD_CHECK" | sed 's/^/    /' | head -8
+fi
+
+# Parsing is not running. The module factory, the slot factory and the component
+# tree are all evaluated when the user opens Settings, long after the Host
+# reported a successful install — which is exactly how a bad relative require and
+# a stale component reference both shipped looking healthy.
+RENDER_CHECK="$("$NODE_BIN" "$REPO_ROOT/scripts/check-client-render.mjs" 2>&1)"
+RENDER_STATUS=$?
+if [ "$RENDER_STATUS" -eq 0 ]; then
+  pass "client.js 按模块表语义可加载、可渲染"
+else
+  fail "client.js 渲染检查未通过"
+  printf '%s\n' "$RENDER_CHECK" | grep -E "✗|❌" | sed 's/^/    /' | head -8
+fi
+
+# ---------------------------------------------------------------------------
 # 5. Loader composition (the real proof)
 # ---------------------------------------------------------------------------
 step "5. Loader 组合（真实 dsh --dump-config）"

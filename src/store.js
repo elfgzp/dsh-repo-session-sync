@@ -67,7 +67,17 @@ async function writeFileAtomic(filePath, content) {
 async function readJsonQuiet(filePath) {
   try {
     return JSON.parse(await readFile(filePath, 'utf8'))
-  } catch {
+  } catch (error) {
+    const code = error?.code
+    // A missing file is normal on a first run and must stay quiet. Anything else
+    // (corrupt JSON, EACCES, EISDIR) means the caller is about to fall back to
+    // defaults and the user's data appears to have vanished — worth a warning.
+    if (code !== 'ENOENT') {
+      console.warn(
+        `[dsh-repo-session-sync] 读取 ${filePath} 失败，将使用默认值`,
+        error instanceof Error ? error.message : String(error),
+      )
+    }
     return undefined
   }
 }

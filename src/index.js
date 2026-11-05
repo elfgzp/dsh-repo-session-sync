@@ -79,6 +79,9 @@ const VERSION = (() => {
       const require = createRequire(import.meta.url)
       return String(require('../package.json').version ?? '0.0.0')
     } catch {
+      // Not fatal — a version string must never fail activation — but silence
+      // here means the About line reads 0.0.0 with no explanation.
+      console.warn('[dsh-repo-session-sync] 读不到 package.json 的版本，回退 0.0.0')
       return '0.0.0'
     }
   }
@@ -97,7 +100,14 @@ const VERSION = (() => {
 function safeGet(ctx, name) {
   try {
     return typeof ctx?.get === 'function' ? ctx.get(name) : undefined
-  } catch {
+  } catch (error) {
+    // `ctx.get` throws when the read itself is not permitted. Swallowing that
+    // would make the plugin behave as if the service were simply absent — a
+    // wrong diagnosis that costs a debugging round, so name the service.
+    ctx?.logger?.warn?.(
+      `repo-session-sync: 读取服务 ${name} 失败，按「不可用」继续`,
+      error instanceof Error ? error.message : String(error),
+    )
     return undefined
   }
 }

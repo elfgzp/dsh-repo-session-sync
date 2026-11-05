@@ -970,7 +970,14 @@ function safeGetState(store) {
   try {
     const state = typeof store?.getState === 'function' ? store.getState() : null
     return state === undefined ? null : state
-  } catch {
+  } catch (error) {
+    // A throwing getState would otherwise render as "no repositories bound",
+    // which is a wrong answer rather than a degraded one. Say so — silently
+    // degrading is what made an earlier defect take a full round to find.
+    console.warn(
+      '[dsh-repo-session-sync] 读取插件状态失败，界面可能显示为空',
+      error instanceof Error ? error.message : String(error),
+    )
     return null
   }
 }
