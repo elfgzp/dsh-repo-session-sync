@@ -169,18 +169,14 @@ repoKey = normalizeRemoteUrl(remoteOriginUrl)
 > **ADR-1**：绑定键 = 归一化 remote URL。**分支不进键**，只作为 manifest 里的
 > 提示字段（`branch`），用于展示与"锚点过期"判断，不参与身份。
 
-#### ⚠️ 实现现状与 ADR-1 相悖（必须修）
+#### 为什么分支不能进身份键（三条独立证据）
 
-`src/repo-binding.js` 的 `repoKeyOf()` 当前实现是：
+> **状态：已修复。** 早期实现的 `repoKeyOf()` 曾返回
+> `` `${remote.canonical}\u0000${branch}` ``（连同 JSDoc 一起写着），与 ADR-1 相悖。
+> 现已改为只返回 `remote.canonical`，模块头注释、tool description、
+> systemPrompt 三处文案同步更正。以下保留论证，供后来者理解为什么不能改回去。
 
-```js
-return `${remote.canonical}\u0000${branch}`     // ← 含分支，违反 ADR-1
-```
-
-而它的 JSDoc 也这么写着。**代码注释和设计文档互相矛盾时，实现者会照注释写**，
-所以这条必须在改代码的同时把注释一起改掉，否则下次还会有人照抄。
-
-**为什么这件事比我最初说的更严重**——三条独立证据：
+**三条独立证据：**
 
 1. **会话 header 里没有 branch 字段**（实测 219 个真实会话，字段全集只有
    `agentPreset / createdAt / cwd / delegationDepth / id / isSeeded /
