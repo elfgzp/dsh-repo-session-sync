@@ -307,7 +307,13 @@ function formatPending(pending, direction) {
  * @returns {string} 空串表示不需要显示。
  */
 function formatAnchorText(state) {
-  const behind = Number(state?.anchor?.behind ?? state?.behind) || 0
+  const anchor = state?.anchor
+  if (anchor === null || anchor === undefined) return ''
+  // The engine stores the anchor as captured (`{headCommit, branch, dirtyCount,
+  // capturedAt}`); drift is computed at download time and reported separately as
+  // `{commitsBehind, status}`. Accept either spelling so the row keeps working
+  // whichever side of that split supplies it.
+  const behind = Number(anchor.behind ?? anchor.commitsBehind ?? state?.behind) || 0
   if (behind <= 0) return ''
   return `会话基于 ${behind} 个 commit 之前`
 }

@@ -27,7 +27,24 @@ file, message them instead of editing it.
 | `session-store.js` | sync engine (dev-sync) | Read and decode DSH session logs; write sessions back on download. | done |
 | `transport.js` | sync engine (dev-sync) | Push/pull/probe a session bundle over the chosen channel. | **missing** |
 | `conflict.js` | sync engine (dev-sync) | Decide what happens when both sides advanced. Must never silently overwrite. | **missing** |
-| `anchor.js` | sync engine (dev-sync) | Record and compare the repository commit a session was based on. | **missing** |
+| `anchor.js` | sync engine (dev-sync) | Record and compare the repository commit a session was based on (ADR-5). | done |
+
+### Anchor data path
+
+An anchor says what the repository looked like when a conversation happened. It
+crosses three files and the remote, so the wiring is worth stating once:
+
+| Step | Where | What |
+|---|---|---|
+| capture | `engine.js` `runUp`, via `anchor.js` `captureAnchor()` | once per upload, never per download — a download must not overwrite the recording |
+| carry | `transport.js` `push` → manifest `anchor` | travels with the sessions; a locally-kept anchor is useless on the other machine |
+| read | `transport.js` `pull` → `session.anchor` | validated with `normalizeAnchor()` because it is untrusted input |
+| compare | `engine.js` `runDown`, via `describeAnchorDrift()` | per session, against this machine's HEAD |
+| surface | `SyncResult.anchorDrift[]` | `{sessionId, status, commitsBehind, shortSha, message}`, advisory only |
+
+`status` is one of `current` / `behind` / `diverged` / `missing-commit` / `none` /
+`unknown`. **No status ever gates a sync** — the anchor is a hint about staleness,
+and losing a conversation over a missing hint would be a bad trade.
 
 `deps.js` degrades cleanly while these are absent: sync operations report
 `not-implemented`, and binding plus the settings page keep working. That ordering
