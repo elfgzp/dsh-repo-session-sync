@@ -65,8 +65,8 @@ $ （见附录 A2）
   ('sub', 'id_bare',     'dir==id')  n=151
   ('top', 'id_has_prefix','dir==id') n=67
 
-sample top-level : dir=session-22614150-…  id =session-22614150-…
-sample subagent  : dir=70c5de98-…         id =70c5de98-…   parent=session-c54ce8bf-…
+sample top-level : dir=session-<uuid-top>  id =session-<uuid-top>
+sample subagent  : dir=<uuid-sub>         id =<uuid-sub>   parent=session-<uuid-parent>
 ```
 
 > **结论（重要）**：`header.id` 与目录名**逐字符相等**，采样 218/218 全中。
@@ -82,58 +82,80 @@ sample subagent  : dir=70c5de98-…         id =70c5de98-…   parent=session-c5
 
 ## 2. projectKey：cwd 的不可逆编码
 
-### 2.1 已验证的编码规则
+### 2.1 权威编码规则（依据 DSH 官方实现）
 
 ```js
-// 经 7 个真实 cwd ↔ 目录名逐一比对，7/7 全部匹配
+// 逐字符处理；这是权威算法（来自 DSH persistence 包的 projectKey 实现）
+let readable = '', separatorRun = false
+for (const ch of cwd) {
+  if (ch === '/' || ch === '\\' || ch === ':') {
+    if (!separatorRun) readable += '-'
+    separatorRun = true                        // 连续分隔符只产出一个 '-'
+  } else if (ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch)) {
+    readable += ch                             // 安全字符原样保留
+    separatorRun = false
+  } else {
+    readable += '~' + codePoint.toString(16).toUpperCase().padStart(4, '0')  // ~XXXX
+    separatorRun = false
+  }
+}
+projectKey = '--' + (readable.replace(/^-+/, '') || 'root').slice(0, 251) + '--'
+```
+
+`cwd` 为空或缺省时目录名为 `_no-cwd`。
+
+**已实测的实例**（全是纯 ASCII 路径，两种算法结果一致，故仅能证明"安全字符原样保留"）：
+
+```
+cwd                                              实际目录名
+/Users/<you>/.dsh/profiles/desktop               --Users-<you>-.dsh-profiles-desktop--
+/Users/<you>/Documents/<proj-b>                  --Users-<you>-Documents-<proj-b>--
+/Users/<you>/Work/<proj-c>                       --Users-<you>-Work-<proj-c>--
+/Users/<you>/.dsh/gongfeng-mr/repos/o__r/x__y    --Users-<you>-.dsh-gongfeng-mr-repos-o__r-x__y--
+...                                              ALL MATCH (7/7)
+```
+
+### 2.2 ⚠️ 一个必须记录的踩坑：样本全是纯 ASCII 时会得出错误规则
+
+早期版本的本文档写的是简化规则：
+
+```js
+// ❌ 不完整 —— 只对纯 ASCII 且无特殊字符的路径成立
 projectKey(cwd) = '--' + cwd.replace(/^\//, '').replaceAll('/', '-') + '--'
-// 空 cwd → '_no-cwd'
 ```
 
-实测（路径已脱敏）：
+这条规则在本机 7 个 cwd 上也是 **7/7 全中**，因此看起来"已验证"。但它与权威实现
+在以下输入上**分歧**（实测）：
 
 ```
-cwd                                                   实际目录名                              结果
-/Users/<you>/.dsh/profiles/desktop                    --Users-<you>-.dsh-profiles-desktop--    OK
-/Users/<you>/Documents/<proj-b>                       --Users-<you>-Documents-<proj-b>--       OK
-/Users/<you>/Work/<proj-c>                            --Users-<you>-Work-<proj-c>--            OK
-...
-ALL MATCH: True (7 distinct cwds)
+cwd                        权威实现                        简化规则（错）
+/Users/x/项目/repo          --Users-x-~9879~76EE-repo--     --Users-x-项目-repo--
+/Users/x/my repo            --Users-x-my~0020repo--         --Users-x-my repo--
+/Users/x/a~b                --Users-x-a~007Eb--             --Users-x-a~b--
+/Users/x/a//b               --Users-x-a-b--                 --Users-x-a--b--
 ```
 
-> **实现陷阱**：公式是 `replace(/^\//,'')` 去掉**一个**前导斜杠。
-> 如果写成 `'--' + cwd.replaceAll('/','-') + '--'`，会得到 `---Users-…`（三个横杠）导致永远不匹配。
-> 这是一个真实踩过的坑，写在这里避免重复。
+**教训（对本项目有普遍意义）**：本机全部路径恰好是 `[A-Za-z0-9._-]`，
+于是"安全字符原样保留"这一条被样本证实，而"不安全字符怎么处理"这一条
+**根本没被覆盖到**——用这样的样本去反推完整算法，必然把规则写窄。
+任何"7/7 全中"的结论都要先问：**样本是否覆盖了算法的每个分支？**
 
-### 2.2 不可逆的三重原因
+因此：
 
-**注意：不是"字符塌缩"**。实测证明 `.`、`_`、`-` 都是**原样保留**的：
+- **权威实现以 DSH 源码为准**（本文档的 2.1 节）；
+- 本机实测只能作为"该实现在此样本上行为一致"的佐证，**不能替代源码**；
+- 中文/空格/`~`/连续分隔符等路径在实现里**必须有自己的测试用例**。
 
-```bash
-$ # 用真实长路径验证哪些字符被保留
-cwd     : /Users/<you>/.dsh/gongfeng-mr/repos/org__itfs/feat__keyword-index-admin
-formula : --Users-<you>-.dsh-gongfeng-mr-repos-org__itfs-feat__keyword-index-admin--
-actual  : --Users-<you>-.dsh-gongfeng-mr-repos-org__itfs-feat__keyword-index-admin--
-MATCH   : True
+### 2.2b 不可逆的三重原因
 
-chars preserved proof:
-  '.dsh' segment kept its dot      : True
-  'org__itfs' kept underscores     : True
-  'gongfeng-mr' kept its hyphen    : True
+**注意：不是"字符塌缩"**。`.`、`_`、`-` 都是原样保留的（实测见 2.1）。
 
-=> ONLY '/' is rewritten to '-'. Every other char is literal.
-```
+真正的不可逆性来自三处：
 
-真正的不可逆性来自三处（依据 DSH 官方 `persistence` 包源码，非本文实测）：
-
-1. **分隔符 `-` 有歧义**：`/` 被改写成 `-`，于是"一个 `-`"到底是路径分隔符、
+1. **分隔符与字面 `-` 有歧义**：`/` 被改写成 `-`，于是"一个 `-`"到底是路径分隔符、
    还是目录名里本来就有的连字符，无法区分。
-2. **`separatorRun` 合并**：连续分隔符被折叠，`/Users/a/b` 与 `/Users/a//b` 撞到同一个 key。
-3. **截断**：超长路径截断到固定长度上限，超长后不同 cwd 可能撞车。
-
-> 官方源码里 `~XXXX` 形式的转义确实存在，但它作用于**其它层**（例如 `encodeSegment`
-> 对 sessionId 段的编码），**不作用于 cwd → projectKey 这一层**。本文实测的这一层
-> 只做 `/`→`-`。两者不要混为一谈。
+2. **`separatorRun` 合并**：连续分隔符折叠成一个 `-` → `/Users/a/b` 与 `/Users/a//b` 撞同一 key。
+3. **截断**：`slice(0, 251)` → 超长路径被截断后，不同 cwd 可能撞车。
 
 ### 2.3 由此得到的硬规则
 
@@ -366,7 +388,7 @@ A is prefix of B: True
 
 ```
 inode=1143237939 size=248633 → 262604 → 262698
-frame0_sha=fa21bb36…（全程恒定）
+frame0_sha=<sha>（全程恒定）
 ```
 
 即：**文件只在尾部增长，历史字节永不改写**。因此"已同步到第 N 字节"是安全水位线，
@@ -409,12 +431,12 @@ DSH 的 append 契约要求新事件的 first seq 必须等于已存的 next-seq
 probe1: LIVE      # 当前对话所在会话
 probe2: LIVE      # 15 秒后再次探测，仍 LIVE，且文件仍在增长
 
-f0f7e761-…       lock_age=  66min  IDLE
-ef220442-…       lock_age=  68min  IDLE
-98f57b15-…       lock_age=  70min  IDLE
-session-7989a286-…  lock_age=1605min  IDLE
-session-3ff96526-…  lock_age=2889min  IDLE
-session-0ecf5969-…  lock_age=2959min  IDLE
+<uuid-1>       lock_age=  66min  IDLE
+<uuid-2>       lock_age=  68min  IDLE
+<uuid-3>       lock_age=  70min  IDLE
+session-<uuid-3>  lock_age=1605min  IDLE
+session-<uuid-4>  lock_age=2889min  IDLE
+session-<uuid-5>  lock_age=2959min  IDLE
 ```
 
 探测方法（非阻塞、不修改文件、不阻塞 DSH）：
