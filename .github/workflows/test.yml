@@ -7,7 +7,7 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Cancel superseded runs on the same ref — this repo has several agents pushing.
+# Cancel superseded runs on the same ref — several contributors push here.
 concurrency:
   group: test-${{ github.ref }}
   cancel-in-progress: true
@@ -16,107 +16,168 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  # ───────────────────────────────────────────────────────────────────────────
+  # GATING JOB — must pass. These are the runtimes package.json supports
+  # (`engines.node >= 22.19`), and both have native zstd, so every test runs for
+  # real and the write path is genuinely exercised.
+  # ───────────────────────────────────────────────────────────────────────────
+  test-supported:
     name: test (node ${{ matrix.node }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # Two runtimes on purpose, chosen so that BOTH decode paths are really
-        # exercised. `zlib.zstdDecompressSync` landed in Node v22.15.0, so:
-        #  - 20.x has NO native zstd  -> covers the pure-JS frame decoder
-        #  - 22.x has native zstd     -> covers the runtime decoder
-        # Pinning exact minimums (not bare '20'/'22') matters: if the runner ever
-        # picked a 22.0-22.14 image, the "native zstd" job would silently test
-        # the fallback path instead and the matrix would stop covering anything
-        # new. The step below asserts the capability at runtime so this cannot
-        # regress quietly.
-        node: ['20.x', '22.15']
+        # 22.15 is the first release with zlib.zstdCompressSync, required to
+        # write sessions in DSH's format. 24 covers a newer major.
+        node: ['22.15', '24']
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Node ${{ matrix.node }}
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
 
-      - name: Show environment and assert the zstd capability matches the job's purpose
+      - name: Assert the runtime really has native zstd
+        # HARD FAIL, not a skip. Writing sessions requires zstd; if this runtime
+        # silently lacked it, a fallback would be exercised and the suite would
+        # quietly verify less. Pin the assumption so it cannot drift.
         run: |
           node --version
-          git --version
           node -e "
-            const native = typeof require('node:zlib').zstdDecompressSync === 'function';
-            console.log('native zstd:', native);
-            const expected = process.env.EXPECT_NATIVE_ZSTD === '1';
-            if (native !== expected) {
-              console.error('::error::This job expects native zstd = ' + expected + ' but got ' + native +
-                ' on node ' + process.version + '. The matrix no longer covers both code paths.');
+            const z = require('node:zlib');
+            const hasZstd = typeof z.zstdCompressSync === 'function'
+              && typeof z.zstdDecompressSync === 'function';
+            console.log('native zstd:', hasZstd);
+            if (!hasZstd) {
+              console.error('::error::This job requires native zstd (Node >= 22.15). ' +
+                'Without it the write path cannot be exercised. Current: ' + process.version);
               process.exit(1);
             }
           "
-        env:
-          # node 20 -> pure-JS path; node 22.15+ -> native path.
-          EXPECT_NATIVE_ZSTD: ${{ startsWith(matrix.node, '22') && '1' || '0' }}
 
       - name: Configure git identity
-        # The transport tests create real repositories and commits. CI runners
-        # have no user.name/user.email, so set one here rather than letting git
-        # fail (or prompt) inside a test.
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+          # Mirrors a real machine posture (and the environment that exposed the
+          # commit-tree identity bug): no implicit identity lookup.
+          git config --global user.useconfigonly true
+
+      - name: Privacy scan
+        # Public repository: fail before any test output could echo user paths.
+        run: ./scripts/check-private.sh
+
+      - name: Run tests
+        run: node --test "test/**/*.test.js"
+
+      - name: Enforce zero skipped tests
+        # A skipped test verifies nothing while making the report look green.
+        # On supported runtimes there is no legitimate reason to skip.
+        run: |
+          set -o pipefail
+          node --test "test/**/*.test.js" 2>&1 | tee /tmp/out.txt
+          if grep -qE '^ℹ skipped [1-9]|^# skipped [1-9]' /tmp/out.txt; then
+            echo "::error::At least one test was skipped on a supported runtime."
+            grep -iE 'skip' /tmp/out.txt || true
+            exit 1
+          fi
+          echo "no skipped tests"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # KNOWN-LIMITATION JOB — allowed to fail, isolated so it cannot mask a real
+  # regression in the gating job above.
+  #
+  # WHY: Node < 22.15 has no zstd compressor. The engine deliberately REFUSES to
+  # write a session rather than emit a file DSH cannot read, so tests that go
+  # through the real write path cannot pass there. The e2e suites inject a
+  # zero-dependency frame encoder so most still run, but this job stays
+  # informational: it reports the legacy story without pretending all is well.
+  # ───────────────────────────────────────────────────────────────────────────
+  test-legacy-node:
+    name: test (node ${{ matrix.node }}) — informational, may fail
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20.x']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Explain the known limitation up front
+        run: |
+          cat <<'MSG'
+          ======================================================================
+          KNOWN LIMITATION — this job is INFORMATIONAL and is allowed to fail.
+
+          Node < 22.15 has no zlib zstd compressor. This package declares
+          engines.node >= 22.19 and needs zstd to WRITE session files: the format
+          must be zstd frames or DSH itself cannot read them back.
+
+          If this job is red, check whether the failures are:
+            * "没有 zstd 压缩能力" / "requires native zstd"  -> expected
+            * anything else                                   -> investigate,
+              but the gating test-supported job is authoritative.
+
+          Do NOT "fix" this job by adding t.skip() — a skip hides the limitation
+          instead of reporting it.
+          ======================================================================
+          MSG
+
+      - name: Configure git
         run: |
           git config --global user.name "ci"
           git config --global user.email "ci@example.invalid"
           git config --global init.defaultBranch main
 
-      - name: Privacy scan (must pass before anything else)
-        # This repository is public. Failing fast here means a leaked path or
-        # credential never reaches the test output or an artifact.
-        run: ./scripts/check-private.sh
+      - name: Run tests (informational)
+        run: node --test
+        continue-on-error: true
 
-      - name: Run test suite
-        # Explicit glob: works on Node 22+. On Node 20 `--test` does not expand
-        # globs, so fall back to the bare form, which both versions support.
+      - name: Summarise the legacy-runtime result
+        if: always()
         run: |
-          if [ "${{ matrix.node }}" = "20" ]; then
-            node --test
-          else
-            node --test "test/**/*.test.js"
-          fi
+          set +e
+          node --test > /tmp/legacy.txt 2>&1
+          {
+            echo "### node ${{ matrix.node }} (unsupported, informational)"
+            echo '```'
+            grep -E '^ℹ (tests|pass|fail|skipped)|^# (tests|pass|fail|skipped)' /tmp/legacy.txt || true
+            grep -E '^✖ |^not ok ' /tmp/legacy.txt | head -20 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Assert zero skipped tests
-        # A skipped test looks green while verifying nothing. On CI we require
-        # that every test actually ran.
-        run: |
-          set -o pipefail
-          if [ "${{ matrix.node }}" = "20" ]; then
-            node --test 2>&1 | tee /tmp/test-output.txt
-          else
-            node --test "test/**/*.test.js" 2>&1 | tee /tmp/test-output.txt
-          fi
-          echo "--- summary ---"
-          if grep -qE '^# skipped [1-9]|^ℹ skipped [1-9]' /tmp/test-output.txt; then
-            echo "::error::At least one test was skipped — skipped tests verify nothing."
-            grep -E '^not ok .*# SKIP|SKIP' /tmp/test-output.txt || true
-            exit 1
-          fi
-          echo "no skipped tests"
-
+  # ───────────────────────────────────────────────────────────────────────────
+  # Independent privacy gate — a second opinion, not a copy of the scan inside
+  # the test job (which a source change could weaken).
+  # ───────────────────────────────────────────────────────────────────────────
   privacy:
     name: privacy guard
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Scan repository for machine-specific data
+      - name: Scan tracked files for machine-specific data
         run: |
           ./scripts/check-private.sh
-          echo "--- explicit checks ---"
-          # Real home directories must never appear in tracked files.
+
+          echo "--- independent checks ---"
           if git ls-files -z | xargs -0 grep -nIE '/Users/[a-z0-9_.-]+/(Documents|Github|Work|\.dsh)' 2>/dev/null \
              | grep -v 'scripts/check-private.sh'; then
             echo "::error::A real home directory leaked into a tracked file."
             exit 1
           fi
-          # Fixtures must be synthetic: no real-looking session ids outside tests
-          # that are explicitly documents/examples. The reference checker already
-          # covers this; this is a second, independent opinion.
+
+          if git ls-files -z \
+             | xargs -0 grep -nIE 'session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' 2>/dev/null \
+             | grep -vE '^(test/|docs/|scripts/check-private\.sh)' \
+             | grep -vE 'session-0{8}-0{4}-[0-9a-f]{4}-[0-9a-f]{4}-0{12}'; then
+            echo "::error::A non-synthetic session id appears outside test/ and docs/."
+            exit 1
+          fi
           echo "privacy checks passed"

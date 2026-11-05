@@ -101,6 +101,27 @@ async function makeEngine({ base, home, repoPath, registryOverride, visibilityOv
   if (registryOverride) Object.assign(deps, { registry: registryOverride });
   if (visibilityOverride) Object.assign(deps, { visibility: visibilityOverride });
 
+  // Node < 22.15 has no native zstd compressor, so the production frame encoder
+  // refuses to write (correctly: it must not emit a file DSH cannot read). That
+  // would make every write-path assertion here untestable on such runtimes.
+  // Rather than skip — a skip verifies nothing — inject a zero-dependency,
+  // spec-compliant encoder so the real write and rollback code still runs.
+  const zlib = await import('node:zlib');
+  if (typeof zlib.default.zstdCompressSync !== 'function') {
+    const { encodeFrame } = await import('../lib/zstd-frame.mjs');
+    const encoded = (buf) => encodeFrame(buf);
+    if (deps.sessions && typeof deps.sessions.write === 'function') {
+      const originalWrite = deps.sessions.write.bind(deps.sessions);
+      deps.sessions.write = (payload, opts = {}) =>
+        originalWrite(payload, { ...opts, frameEncoder: opts.frameEncoder ?? encoded });
+    }
+    if (deps.sessionOps && typeof deps.sessionOps.appendToSession === 'function') {
+      const originalAppend = deps.sessionOps.appendToSession.bind(deps.sessionOps);
+      deps.sessionOps.appendToSession = (payload, opts = {}) =>
+        originalAppend(payload, { ...opts, frameEncoder: opts.frameEncoder ?? encoded });
+    }
+  }
+
   // The workspace registry reaches the engine through `meta.getWorkspaceRegistry`
   // (a live service getter, resolved after construction in the real plugin). The
   // down path refuses to write when it is absent — correctly, since sessions it

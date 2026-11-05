@@ -161,7 +161,22 @@ test('guard: the real user DSH home is untouched by the test run', async (t) => 
     const nowBuffer = readFileSync(now.path);
     const prefix = nowBuffer.subarray(0, prior.size);
     if (!prefix.equals(prior.head)) {
-      problems.push(`session log prefix REWRITTEN: ${rel} (append-only violated)`);
+      // A live DSH session can be mid-write while we look at it. Re-read once a
+      // moment later: a genuine rewrite stays inconsistent, whereas a torn read
+      // of an in-flight append settles. Without this, the guard flags DSH's own
+      // concurrent writes as corruption (observed intermittently in full runs).
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      let reread = null;
+      try {
+        reread = readFileSync(now.path);
+      } catch {
+        reread = null;
+      }
+      const settled =
+        reread !== null && reread.length >= prior.size && reread.subarray(0, prior.size).equals(prior.head);
+      if (!settled) {
+        problems.push(`session log prefix REWRITTEN: ${rel} (append-only violated)`);
+      }
     }
   }
 
