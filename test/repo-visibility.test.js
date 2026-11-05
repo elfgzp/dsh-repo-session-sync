@@ -454,17 +454,56 @@ describe('detectRegression —— 上行前重校验', () => {
     assert.equal(r.ok, false)
   })
 
-  test('⭐ 只有当前为 private 才放行（穷举验证）', () => {
-    for (const previous of [undefined, ...VERDICT_LIST]) {
-      for (const current of VERDICT_LIST) {
-        const r = detectRegression({ previous, current })
-        if (current === VERDICT.PRIVATE) {
-          assert.equal(r.ok, true, `previous=${previous} current=private 应放行`)
-        } else {
-          assert.equal(r.ok, false, `previous=${previous} current=${current} 必须中止`)
-        }
+  test('⭐ 只有当前为 private 才放行（无确认时的穷举验证）', () => {
+    // 没有 consent 记录时，私有可能放行 —— 这是基线安全性。
+    for (const current of VERDICT_LIST) {
+      const r = detectRegression({ previous: undefined, current })
+      if (current === VERDICT.PRIVATE) {
+        assert.equal(r.ok, true, 'current=private 且无确认记录 → 应放行')
+      } else {
+        assert.equal(r.ok, false, `current=${current} 且无确认记录 → 必须中止`)
       }
     }
+  })
+
+  test('⭐⭐ 对照 PRD §6.4 语义表：校验的是偏离度，不是"是不是 public"', () => {
+    // 这张表来自 docs/prd.md §6.4。**如果谁把它改回"见 public 就拦"，
+    // 这条测试会立刻红** —— 那是等价于硬拦截的回归，产品原则 P5 明确禁止。
+    //
+    //   previous（用户 consent 时的可见性） → current（本次判定） → 是否放行
+    const CASES = [
+      ['public', 'public', true, '确认过公开、仍是公开 → 放行（偏离度为零）'],
+      ['public', 'private', true, '确认过公开、变私有 → 放行（更安全）'],
+      ['public', 'unknown', false, '确认过公开、判不出来 → 中止'],
+      ['private', 'public', false, '私有变公开 → 中止 + 告警（最危险）'],
+      ['private', 'unknown', false, '私有判不出来 → 中止'],
+      ['private', 'private', true, '私有仍是私有 → 放行'],
+      ['unknown', 'private', true, '未知变私有 → 放行'],
+      ['unknown', 'public', false, '未知变公开 → 中止（unknown 不绑定 consent）'],
+      ['unknown', 'unknown', false, '未知仍是未知 → 中止（每次都要重新确认）'],
+      [undefined, 'private', true, '无确认 + 私有 → 放行'],
+      [undefined, 'public', false, '无确认 + 公开 → 中止'],
+      [undefined, 'unknown', false, '无确认 + 未知 → 中止'],
+    ]
+
+    for (const [previous, current, shouldPass, why] of CASES) {
+      const r = detectRegression({ previous, current })
+      assert.equal(r.ok, shouldPass, `previous=${previous} current=${current}：${why}`)
+    }
+  })
+
+  test('⭐ public→public 放行是产品硬要求（否则等于硬拦截）', () => {
+    // 单列这条，因为它是 PRD 里被明确点出的一个"常见实现错误"。
+    // 用户对公开仓库做了逐字确认之后，如果每次上行还被拦，产品就没法用。
+    const r = detectRegression({ previous: VERDICT.PUBLIC, current: VERDICT.PUBLIC })
+    assert.equal(r.ok, true, '确认过公开仓库后必须放行，否则与硬拦截无异')
+    assert.equal(r.regression, false, '没有发生偏离，不该标记为退化')
+  })
+
+  test('安全退化（private→public）被标记为 regression 以便告警', () => {
+    const r = detectRegression({ previous: VERDICT.PRIVATE, current: VERDICT.PUBLIC })
+    assert.equal(r.ok, false)
+    assert.equal(r.regression, true, '这是最危险路径，必须能被识别出来做告警')
   })
 })
 

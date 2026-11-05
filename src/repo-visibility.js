@@ -507,25 +507,88 @@ export function verifyTypedConfirmation({ check, typed, acknowledged } = {}) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * 对比上次记录的可见性与本次实时判定，判断是否发生了**安全退化**。
+ * 每次上行前的重校验：判断本次判定是否**偏离了用户当初确认的那一种可见性**。
  *
- * 这是防"今天私有、明天转公开"的唯一有效手段：**拦截点不能只在启用时**，
- * 每次上行前都要重判一次。
+ * ## 这一层到底校验什么（容易做错，务必读完）
+ *
+ * **错误做法**：每次上行都判「当前是不是 `public`」，是就中止。
+ * 后果是用户即使对 public 仓库做了知情确认，每次上行仍被中止 ——
+ * **等价于硬拦截**，正是产品原则 P5 明确要避免的。
+ *
+ * **正确做法**：校验的是「**偏离度**」，不是「是不是 public」。
+ *
+ * | 已确认的可见性 | 本次判定 | 结果 |
+ * |---|---|---|
+ * | `public`（用户已逐字确认） | `public` | ✅ 放行（偏离度为零） |
+ * | `public` | `private` | ✅ 放行（变得更安全了，可顺带更新记录） |
+ * | `public` | `unknown` | ❌ 中止（无法确认是否仍为公开） |
+ * | `private` | `public` | ❌ 中止 + 告警（安全退化，最危险路径） |
+ * | `private` | `unknown` | ❌ 中止（查不到不等于安全） |
+ * | `unknown` | 任意 | ❌ 中止，要求重新确认（`unknown` 不绑定 consent） |
+ *
+ * ## `previous` 该传什么
+ *
+ * **必须传「用户 consent 时记录的可见性」，不是「上一次运行时的判定结果」。**
+ * 后者会让一个正常抖动（网络刚好断了）清掉用户的确认，把用户永远卡在门外。
+ *
+ * 如果用户从未确认过（没有 consent 记录），调用方应把 `previous` 传 `undefined`，
+ * 此时只有 `private` 能直接放行。
  *
  * @param {object} input
- * @param {string} [input.previous] - 上次记录的 verdict。
- * @param {string} input.current - 本次判定的 verdict。
+ * @param {string} [input.previous] - 用户 consent 时记录的可见性。
+ * @param {string} input.current - 本次实时判定的可见性。
  * @returns {{ok: boolean, regression: boolean, reason: string}}
- *   `ok: false` 表示**必须中止本次上行**。
+ *   `ok: false` 表示**必须中止本次上行**；`regression: true` 表示相比已确认状态
+ *   发生了安全退化（用于告警措辞）。
  */
 export function detectRegression({ previous, current } = {}) {
   const prev = normalizeHint(previous)
-  const curr = String(current ?? VERDICT.UNKNOWN)
+  const curr = normalizeHint(current) || String(current ?? VERDICT.UNKNOWN)
 
-  if (curr === VERDICT.PRIVATE) return { ok: true, regression: false, reason: '' }
+  // `unknown` 从不绑定 consent：每次都可能是不同情况，每次都要求重新确认。
+  // 用户确认过 `unknown` 之后，下一次仍然要重新问 —— 所以这里 prev 为 unknown
+  // 等价于「没有可用的确认」，与 undefined 同样处理。
+  const confirmed = prev === VERDICT.PRIVATE || prev === VERDICT.PUBLIC ? prev : null
 
-  // 从"确认私有"变成"公开" —— 这是最危险的路径，必须中止。
-  if (prev === VERDICT.PRIVATE && curr === VERDICT.PUBLIC) {
+  // 私有仓库永远直接放行 —— 无论此前确认过什么。
+  if (curr === VERDICT.PRIVATE) {
+    return { ok: true, regression: false, reason: '' }
+  }
+
+  // 本次无法判定：只有"当初确认的也是 unknown"才可能放行，而 unknown 不绑定确认
+  // → 一律中止。**查不到不等于安全。**
+  if (curr === VERDICT.UNKNOWN) {
+    if (confirmed === VERDICT.PRIVATE) {
+      return {
+        ok: false,
+        regression: true,
+        reason:
+          '这个仓库以前确认是私有的，但现在无法确认它的可见性（可能是网络问题或权限变化）。'
+          + '为了安全，本次同步已中止，请稍后重试或手动确认仓库可见性。',
+      }
+    }
+    if (confirmed === VERDICT.PUBLIC) {
+      return {
+        ok: false,
+        regression: true,
+        reason:
+          '这个仓库你确认过是公开的，但现在无法确认它是否仍然公开。'
+          + '本次同步已中止。请稍后重试或手动确认仓库可见性。',
+      }
+    }
+    return {
+      ok: false,
+      regression: false,
+      reason: '无法确认远端仓库的可见性，本次同步已中止。请先检测可见性并确认。',
+    }
+  }
+
+  // curr === PUBLIC
+  if (confirmed === VERDICT.PUBLIC) {
+    // 用户当初就是在知情的前提下确认了公开仓库 → 没有偏离 → 放行。
+    return { ok: true, regression: false, reason: '' }
+  }
+  if (confirmed === VERDICT.PRIVATE) {
     return {
       ok: false,
       regression: true,
@@ -535,30 +598,11 @@ export function detectRegression({ previous, current } = {}) {
         + '如果这是误判，请重新检测；如果确实改了可见性，请改回私有或换仓库。',
     }
   }
-
-  if (curr === VERDICT.PUBLIC) {
-    return {
-      ok: false,
-      regression: prev !== VERDICT.PUBLIC,
-      reason: '检测到远端仓库是公开的，本次同步已中止。请改用私有仓库。',
-    }
-  }
-
-  // unknown：如果之前确认过私有而现在判不出来，也中止——**查不到不等于安全**。
-  if (prev === VERDICT.PRIVATE) {
-    return {
-      ok: false,
-      regression: true,
-      reason:
-        '这个仓库以前确认是私有的，但现在无法确认它的可见性（可能是网络问题或权限变化）。'
-        + '为了安全，本次同步已中止，请稍后重试或手动确认仓库可见性。',
-    }
-  }
-
   return {
     ok: false,
     regression: false,
-    reason: '无法确认远端仓库的可见性，本次同步已中止。请先检测可见性并确认。',
+    reason: '检测到远端仓库是公开的，而你没有确认过向公开仓库同步。'
+      + '本次同步已中止。如果确实要这样做，请先完成知情确认。',
   }
 }
 
