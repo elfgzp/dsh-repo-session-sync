@@ -14,6 +14,7 @@ import { execFile } from 'node:child_process'
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { readdir } from 'node:fs/promises'
 import test from 'node:test'
 import { promisify } from 'node:util'
 import zlib from 'node:zlib'
@@ -40,6 +41,10 @@ import {
   sessionsRoot,
   sliceByByteWatermark,
   sliceSinceWatermark,
+  cwdCandidates,
+  findSessionDirsByCwd,
+  writeSession,
+  appendToSession,
 } from '../src/session-store.js'
 import {
 
@@ -579,6 +584,154 @@ test('空会话根 / 不存在的根不会抛错', async () => {
     assert.deepEqual(await scanSessions(join(sandbox.home, 'nope')), [])
     await mkdir(sandbox.sessionsRoot, { recursive: true })
     assert.deepEqual(await scanSessions(sandbox.sessionsRoot, READ_OPTIONS), [])
+  } finally {
+    await sandbox.cleanup()
+  }
+})
+
+// ─────────────────────────────────────────────────────────────
+// macOS 软链：同一目录的多种写法（/var vs /private/var）
+// ─────────────────────────────────────────────────────────────
+
+/** 造一个可写入的会话载荷（本文件后续用例用）。 */
+function makePayload(seed, { cwd = '/tmp/dsh-sandbox/symlink-repo', events = 3 } = {}) {
+  const sessionId = fakeSessionId(seed)
+  return {
+    sessionId,
+    header: {
+      type: 'session',
+      version: 4,
+      id: sessionId,
+      createdAt: 1_700_000_000_000,
+      cwd,
+      isSeeded: false,
+      delegationDepth: 0,
+      agentPreset: 'cordis',
+    },
+    events: Array.from({ length: events }, (_, i) => ({
+      type: 'assistant/message',
+      seq: i,
+      time: 1_700_000_000_000 + i * 1000,
+      data: { text: `synthetic ${i}` },
+    })),
+  }
+}
+
+test('cwdCandidates：列出同一目录的等价写法', () => {
+  const candidates = cwdCandidates('/var/folders/x/repo')
+  // 原值一定在第一位
+  assert.equal(candidates[0], '/var/folders/x/repo')
+
+  if (process.platform === 'darwin') {
+    assert.ok(
+      candidates.includes('/private/var/folders/x/repo'),
+      `/var/... 应能给出 /private/var/... 形式，实际 ${JSON.stringify(candidates)}`
+    )
+  }
+
+  // 反向：给 /private 形式也要能给 /var 形式
+  const back = cwdCandidates('/private/tmp/foo')
+  assert.equal(back[0], '/private/tmp/foo')
+  if (process.platform === 'darwin') {
+    assert.ok(back.includes('/tmp/foo'))
+  }
+
+  // 无关路径不受影响
+  assert.deepEqual(cwdCandidates('/Users/someone/project'), ['/Users/someone/project'])
+  // 空值/非法输入
+  assert.deepEqual(cwdCandidates(''), [])
+  assert.deepEqual(cwdCandidates(null), [])
+})
+
+test('projectKey 必须与 DSH 逐字符一致（不做任何归一化）', () => {
+  // 这是硬约束：DSH 自己逐字符编码、不 realpath。我们若归一化，
+  // 写出的目录名 DSH 自己算不出来 → 它找不到我们的会话。
+  assert.equal(projectKey('/var/folders/x/repo'), '--var-folders-x-repo--')
+  assert.equal(projectKey('/private/var/folders/x/repo'), '--private-var-folders-x-repo--')
+  assert.notEqual(
+    projectKey('/var/folders/x/repo'),
+    projectKey('/private/var/folders/x/repo'),
+    '这两个写法必须得到不同 key（与 DSH 一致）；等价性由查找层处理'
+  )
+})
+
+test('软链写法差异：两种 cwd 都能找到同一个会话，且不会产生两个目录', async (t) => {
+  if (!hasNativeZstd) {
+    t.diagnostic('无原生 zstd 压缩，跳过')
+    return
+  }
+  const sandbox = await makeSandbox()
+  try {
+    const backupDir = join(sandbox.home, 'backups')
+    const payload = makePayload('symlink-forms', { cwd: '/var/dsh-test/repo', events: 3 })
+    const written = await writeSession(payload, {
+      sessionsRoot: sandbox.sessionsRoot,
+      backupDir,
+    })
+
+    // 用另一种写法（/private/var/...）查找，必须能找到同一个目录
+    const found = await findSessionDirsByCwd(
+      sandbox.sessionsRoot,
+      payload.sessionId,
+      '/private/var/dsh-test/repo'
+    )
+    assert.equal(found.length, 1, '两种写法应指向同一个会话目录')
+    assert.equal(found[0], written.sessionDir)
+
+    // 原始写法也能找到
+    const foundRaw = await findSessionDirsByCwd(
+      sandbox.sessionsRoot,
+      payload.sessionId,
+      '/var/dsh-test/repo'
+    )
+    assert.equal(foundRaw[0], written.sessionDir)
+
+    // 关键：目录只有一个，没有分裂
+    const projectDirs = await readdir(sandbox.sessionsRoot)
+    assert.equal(
+      projectDirs.length,
+      1,
+      `同一会话不应产生两个项目目录，实际 ${JSON.stringify(projectDirs)}`
+    )
+  } finally {
+    await sandbox.cleanup()
+  }
+})
+
+test('appendToSession：用另一种 cwd 写法也能找到并追加（历史数据兼容）', async (t) => {
+  if (!hasNativeZstd) {
+    t.diagnostic('无原生 zstd 压缩，跳过')
+    return
+  }
+  const sandbox = await makeSandbox()
+  try {
+    const backupDir = join(sandbox.home, 'backups')
+    // 用 /tmp 形式写入（模拟 DSH 当初记录的 cwd）
+    const payload = makePayload('append-alt-form', { cwd: '/tmp/dsh-test-alt/repo', events: 2 })
+    const first = await writeSession(payload, {
+      sessionsRoot: sandbox.sessionsRoot,
+      backupDir,
+    })
+
+    // 引擎下行时拿到的是 canonical（/private/tmp/...），传给 cwdOverride
+    const result = await appendToSession(
+      {
+        sessionId: payload.sessionId,
+        header: payload.header,
+        events: [
+          { type: 'assistant/message', seq: 2, time: 1, data: { text: 'appended' } },
+        ],
+      },
+      {
+        sessionsRoot: sandbox.sessionsRoot,
+        backupDir,
+        cwdOverride: '/private/tmp/dsh-test-alt/repo',
+      }
+    )
+
+    assert.equal(result.nextSeq, 3, '应能跨写法追加成功')
+    const final = await readSessionDir(first.sessionDir)
+    assert.equal(final.nextSeq, 3)
   } finally {
     await sandbox.cleanup()
   }

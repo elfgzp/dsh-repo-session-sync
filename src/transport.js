@@ -578,8 +578,22 @@ export function createTransport(context = {}) {
         refNamespace: SESSIONS_REF,
         generatedAt: Date.now(),
         chunking: { ...chunking },
+        // 锚点：这次上行时仓库的代码状态（HEAD / branch / 脏文件数）。
+        //
+        // 放在 manifest 里而不是别处，是 ADR-5 的决定：锚点天然随包走、
+        // 天然有 git 历史可追溯、天然进冲突检测流程，且不用去写 DSH 的
+        // workspace.json（那是抢写权）。
+        //
+        // 它只是**提示信息**：下行时用来算「这个会话记录于 N 个提交之前」，
+        // 从不参与同步判定，也从不阻断。所以这里允许为 null（空仓库、
+        // 非 git 目录），调用方不能假设它一定存在。
+        anchor: normalizeAnchorInput(options.anchor),
         sessions: planned.map((p) => ({
           ...p.meta,
+          // 逐会话锚点：设计 §6.1 的形状是按会话记录「这段对话谈的是哪个代码状态」。
+          // 全局 anchor 是本次上行的快照，逐会话 anchor 允许调用方为每个会话
+          // 指定不同的锚点（例如同步历史会话时带上它当初的锚点）。
+          anchor: normalizeAnchorInput(p.anchor ?? options.anchor),
           chunks: p.chunkRefs.map((c) => ({
             digest: c.digest,
             index: c.index,
@@ -941,8 +955,14 @@ export function createTransport(context = {}) {
           watermark: entry.watermark ?? null,
           contentHash: actualHash,
           content,
+          // 解析后的结构：引擎落盘需要 header + events。
+          // `content` 保留原始字节，供需要原样重放的场景使用。
+          header: verified.header,
+          events: verified.events,
           updatedAt: entry.updatedAt ?? null,
           frameCount: verified.frameCount,
+          // 逐会话锚点，同样经过校验（远端不可信）
+          anchor: normalizeAnchorInput(entry.anchor) ?? normalizeAnchorInput(manifest.anchor),
         })
       }
 
@@ -958,6 +978,10 @@ export function createTransport(context = {}) {
         formatVersion: PAYLOAD_VERSION,
         sessions,
         bytes: grandTotal,
+        // 锚点来自远端，一律视为不可信输入 → 用 normalizeAnchor 严格校验后
+        // 才交给上层。非法字段被丢弃而不是原样透传（尤其 headCommit 会被
+        // 拼进 git 命令参数）。
+        anchor: normalizeAnchorInput(manifest.anchor),
         dryRun: options.dryRun === true,
       }
     },
@@ -1098,6 +1122,53 @@ async function estimateChunkDelta(planned, existingOids, repoPath, git) {
   }
 
   return { newChunks, reusedChunks }
+}
+
+/**
+ * 把锚点归一化成 manifest 里可安全存储/读取的形状。
+ *
+ * 这里刻意**不 import `anchor.js`** —— `anchor.js` 已经 import 了本模块的
+ * `runGit`，反向 import 会形成循环依赖。锚点的归一化规则很短，重复一小段
+ * 比制造循环依赖好；两边的一致性由各自测试保证（`anchor.js` 有
+ * `normalizeAnchor`，本模块有这条，规则相同：只接受合法 sha、长度受限的字符串）。
+ *
+ * @param {unknown} anchor 候选锚点（可能来自远端，不可信）
+ * @returns {{headCommit: string|null, branch: string|null, worktree: string|null,
+ *            subPath: string|null, dirtyCount: number|null, capturedAt: number|null} | null}
+ */
+function normalizeAnchorInput(anchor) {
+  if (anchor === null || anchor === undefined || typeof anchor !== 'object') return null
+  if (Array.isArray(anchor)) return null
+  const source = /** @type {Record<string, unknown>} */ (anchor)
+
+  const shaRe = /^[0-9a-f]{7,64}$/i
+  const headCommit =
+    typeof source.headCommit === 'string' && shaRe.test(source.headCommit)
+      ? source.headCommit.toLowerCase()
+      : null
+
+  const str = (value, max = 512) =>
+    typeof value === 'string' && value.length > 0 && value.length <= max ? value : null
+
+  const dirtyCount =
+    Number.isSafeInteger(source.dirtyCount) && source.dirtyCount >= 0
+      ? source.dirtyCount
+      : null
+  const capturedAt =
+    Number.isSafeInteger(source.capturedAt) && source.capturedAt > 0
+      ? source.capturedAt
+      : null
+
+  if (headCommit === null && capturedAt === null) return null
+
+  return {
+    headCommit,
+    branch: str(source.branch, 255),
+    worktree: str(source.worktree),
+    subPath: str(source.subPath),
+    dirtyCount,
+    capturedAt,
+  }
 }
 
 /** 块文件的单段文件名（定宽序号，tree 里天然按序）。 */
@@ -1256,6 +1327,8 @@ function verifySessionContent(content, entry) {
   }
 
   let expected = 0
+  /** @type {object[]} */
+  const events = []
   for (let i = 1; i < lines.length; i++) {
     let event
     try {
@@ -1274,6 +1347,7 @@ function verifySessionContent(content, entry) {
         { hint: '远端数据缺少中间事件，请重新上行。' }
       )
     }
+    events.push(event)
     expected += 1
   }
 
@@ -1284,7 +1358,14 @@ function verifySessionContent(content, entry) {
     )
   }
 
-  return { nextSeq: expected, frameCount: decoded.frames }
+  // 返回解析出来的 header 与事件 —— 调用方（引擎）需要它们才能落盘。
+  // 这里已经付过解压+逐行解析的成本，把结果传出去而不是让上层再解一遍。
+  return {
+    nextSeq: expected,
+    frameCount: decoded.frames,
+    header,
+    events,
+  }
 }
 
 export default createTransport

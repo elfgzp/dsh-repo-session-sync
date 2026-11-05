@@ -67,6 +67,31 @@ test('captureAnchor：记录 HEAD、分支、脏文件数', async () => {
   }
 })
 
+test('captureAnchor：dirtyCount 必须包含 untracked 文件', async () => {
+  const sandbox = await makeSandbox()
+  try {
+    const { repo, git } = await makeRepo(sandbox)
+    await commit(repo, git, 'clean')
+    // 干净仓库
+    assert.equal((await captureAnchor(repo)).dirtyCount, 0)
+
+    // 只加一个「新文件、还没 git add」—— 这同样算工作区有未提交改动
+    await writeFile(join(repo, 'untracked.txt'), 'new\n')
+    const withUntracked = await captureAnchor(repo)
+    assert.equal(
+      withUntracked.dirtyCount,
+      1,
+      'untracked 文件必须计入 dirtyCount，否则这个数字会系统性偏小（对用户撒谎）'
+    )
+
+    // 再改一个已跟踪文件 → 2
+    await writeFile(join(repo, 'file.txt'), 'modified\n')
+    assert.equal((await captureAnchor(repo)).dirtyCount, 2)
+  } finally {
+    await sandbox.cleanup()
+  }
+})
+
 test('captureAnchor：空仓库（还没有提交）不抛错，headCommit 为 null', async () => {
   const sandbox = await makeSandbox()
   try {

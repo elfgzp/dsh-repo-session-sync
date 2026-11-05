@@ -786,3 +786,168 @@ test('push：内容完全没变时全部复用，newChunks 为 0', async () => {
     await sandbox.cleanup()
   }
 })
+
+// ─────────────────────────────────────────────────────────────
+// 锚点随包走（ADR-5）
+// ─────────────────────────────────────────────────────────────
+
+test('push/pull：锚点写进 manifest 并能随包取回', async () => {
+  if (!hasNativeZstd) return
+  const sandbox = await makeSandbox()
+  try {
+    const { workDir } = await makeRepoPair(sandbox)
+    const transport = createTransport({})
+    const binding = { repoId: 'r1', repoPath: workDir }
+    const session = mkSession('anchor-travel', { events: 5 })
+
+    const headCommit = (await runGit(workDir, ['rev-parse', 'HEAD']))
+      .stdout.toString('utf8')
+      .trim()
+    const capturedAt = Date.now()
+
+    await transport.push(
+      binding,
+      { sessions: [{ ...session, content: mkContent(session), eventCount: 5 }] },
+      { anchor: { headCommit, branch: 'main', dirtyCount: 2, capturedAt } }
+    )
+
+    const pulled = await transport.pull(binding)
+    // 全局锚点
+    assert.equal(pulled.anchor?.headCommit, headCommit)
+    assert.equal(pulled.anchor?.branch, 'main')
+    assert.equal(pulled.anchor?.dirtyCount, 2)
+    assert.equal(pulled.anchor?.capturedAt, capturedAt)
+    // 逐会话锚点（设计 §6.1 的形状是按会话记录）
+    assert.equal(pulled.sessions[0].anchor?.headCommit, headCommit)
+  } finally {
+    await sandbox.cleanup()
+  }
+})
+
+test('pull：旧 manifest 没有 anchor 字段时必须能正常读（向后兼容）', async () => {
+  const sandbox = await makeSandbox()
+  try {
+    const { workDir } = await makeRepoPair(sandbox)
+    const transport = createTransport({})
+
+    // 手工造一个「旧版本」manifest：完全没有 anchor
+    const session = mkSession('legacy', { events: 3 })
+    const content = mkContent(session)
+    const chunks = [content]
+    const entries = []
+    const chunkOids = []
+    for (const [i, bytes] of chunks.entries()) {
+      const oid = (await runGit(workDir, ['hash-object', '-w', '--stdin'], { input: bytes }))
+        .stdout.toString('utf8')
+        .trim()
+      chunkOids.push(oid)
+      void i
+    }
+    // 简化：用 push 生成结构，然后重写 manifest 去掉 anchor
+    await transport.push(
+      { repoId: 'r1', repoPath: workDir },
+      { sessions: [{ ...session, content, eventCount: 3 }] },
+      { anchor: { headCommit: 'a'.repeat(40), branch: 'main', capturedAt: Date.now() } }
+    )
+
+    // 读出 manifest，删掉 anchor，重新提交
+    const manifestRaw = await runGit(workDir, ['cat-file', '-p', `${SESSIONS_REF}:manifest.json`])
+    const manifest = JSON.parse(manifestRaw.stdout.toString('utf8'))
+    delete manifest.anchor
+    for (const s of manifest.sessions) delete s.anchor
+
+    const oid = (await runGit(workDir, ['hash-object', '-w', '--stdin'], {
+      input: Buffer.from(JSON.stringify(manifest, null, 2) + '\n', 'utf8'),
+    })).stdout.toString('utf8').trim()
+
+    // 重建 tree：manifest.json 换成新的，其余保持
+    const listing = await runGit(workDir, ['ls-tree', '-z', SESSIONS_REF])
+    const lines = []
+    const dirs = new Map()
+    for (const line of listing.stdout.toString('utf8').split('\0')) {
+      if (!line) continue
+      const [meta, fullPath] = line.split('\t')
+      const [, type, objOid] = meta.split(' ')
+      if (fullPath === 'manifest.json') {
+        lines.push(`100644 blob ${oid}\tmanifest.json`)
+      } else {
+        const slash = fullPath.lastIndexOf('/')
+        const dir = slash === -1 ? '' : fullPath.slice(0, slash)
+        const name = slash === -1 ? fullPath : fullPath.slice(slash + 1)
+        if (!dirs.has(dir)) dirs.set(dir, [])
+        dirs.get(dir).push({ type, oid: objOid, name })
+      }
+    }
+    const buildTree = async (dir) => {
+      const childDirs = [...dirs.keys()].filter(
+        (k) => k !== dir && (dir === '' ? !k.includes('/') : k.startsWith(dir + '/') && !k.slice(dir.length + 1).includes('/'))
+      )
+      const entries = []
+      for (const child of childDirs) {
+        entries.push({
+          type: 'tree',
+          oid: await buildTree(child),
+          name: child.slice(dir === '' ? 0 : dir.length + 1),
+        })
+      }
+      entries.push(...(dirs.get(dir) ?? []))
+      const inputLines = entries.map((e) =>
+        `${e.type === 'tree' ? '040000 tree' : '100644 blob'} ${e.oid}\t${e.name}`
+      )
+      if (dir === '') inputLines.push(`100644 blob ${oid}\tmanifest.json`)
+      const { stdout } = await runGit(workDir, ['mktree'], {
+        input: Buffer.from(inputLines.join('\n') + '\n'),
+      })
+      return stdout.toString('utf8').trim()
+    }
+    const rootTree = await buildTree('')
+    const commit = (await runGit(workDir, ['commit-tree', rootTree, '-m', 'legacy manifest']))
+      .stdout.toString('utf8')
+      .trim()
+    await runGit(workDir, ['update-ref', SESSIONS_REF, commit])
+    await runGit(workDir, ['push', '--force', '--quiet', 'origin', `${SESSIONS_REF}:${SESSIONS_REF}`])
+
+    // 关键：没有 anchor 的旧 manifest 必须能正常读取，不抛错
+    const pulled = await transport.pull({ repoId: 'r1', repoPath: workDir })
+    assert.ok(pulled !== null, '旧 manifest 必须能读')
+    assert.equal(pulled.sessions.length, 1)
+    assert.equal(pulled.anchor, null, '没有 anchor 时应为 null，不是抛错')
+    assert.equal(pulled.sessions[0].anchor, null)
+    void entries
+    void chunkOids
+  } finally {
+    await sandbox.cleanup()
+  }
+})
+
+test('【安全】manifest 里的恶意 anchor 必须被丢弃，不会拼进 git 命令', async () => {
+  if (!hasNativeZstd) return
+  const sandbox = await makeSandbox()
+  try {
+    const { workDir } = await makeRepoPair(sandbox)
+    const transport = createTransport({})
+    const session = mkSession('anchor-hostile', { events: 3 })
+
+    // 恶意 headCommit：如果原样透传并在 describeAnchorDrift 里拼进 git 参数，
+    // 就是参数注入
+    await transport.push(
+      { repoId: 'r1', repoPath: workDir },
+      { sessions: [{ ...session, content: mkContent(session), eventCount: 3 }] },
+      {
+        anchor: {
+          headCommit: 'HEAD; rm -rf /',
+          branch: 'x'.repeat(1000),
+          dirtyCount: -5,
+          capturedAt: 0,
+        },
+      }
+    )
+
+    const pulled = await transport.pull({ repoId: 'r1', repoPath: workDir })
+    // 全字段非法 → normalizeAnchorInput 返回 null
+    assert.equal(pulled.anchor, null, '恶意 anchor 必须被整体丢弃')
+    assert.equal(pulled.sessions[0].anchor, null)
+  } finally {
+    await sandbox.cleanup()
+  }
+})

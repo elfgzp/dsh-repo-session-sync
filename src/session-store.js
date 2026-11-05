@@ -384,6 +384,61 @@ export function assertInside(parent, child) {
 }
 
 /**
+ * 把 cwd 归一化成「同一目录只有一种写法」的形式。
+ *
+ * ## 为什么必须有这一步
+ *
+ * macOS 上 `/tmp`、`/var`、`/etc` 都是符号链接，指向 `/private/...`。
+ * 而 `projectKey` 是**逐字符编码**路径字符串的，于是：
+ *
+ *   /var/folders/x/repo  →  --var-folders-x-repo--
+ *   /private/var/folders/x/repo  →  --private-var-folders-x-repo--
+ *
+ * **这两个路径是同一个目录，却得到两个 projectKey** —— 会话文件会落在两个
+ * 不同的目录里，互相看不见。DSH 自己记录 header.cwd 时用哪种写法我们无法
+ * 控制，所以我们的每一次「写入」和「查找」都可能落在不同目录。
+ *
+ * 实测后果（端到端测试暴露）：本机会话按原始路径写入，下行追加时用
+ * preflight 出来的 canonical 路径去找 → 找不到 → 报 `repo-path-missing`。
+ *
+ * ## 为什么用正则而不是 `fs.realpathSync`
+ *
+ * `realpathSync` 要求路径**存在**。而我们有时要为一个还没 clone 的仓库算
+ * 目录名（dry-run、错误预览），那时 realpath 会抛错。用正则处理已知的
+ * macOS 软链前缀，不依赖文件系统状态，纯函数、可测、零 IO。
+ *
+ * 这里只处理「系统级」软链（`/tmp`、`/var`、`/etc`、`/private/etc`）。
+ * 用户自建的软链不在此列 —— 那需要真 realpath，由调用方在有 IO 时处理。
+ *
+ * @param {string} cwd 原始路径
+ * @returns {string} 归一化后的路径
+ */
+export function canonicalizeCwdForProjectKey(cwd) {
+  if (typeof cwd !== 'string' || cwd === '') return cwd
+
+  // macOS 的系统软链：这些前缀在 darwin 上恒定指向 /private/...
+  // 注意顺序：先匹配更长的前缀，避免 /private/var 被 /var 规则误处理
+  const prefixMap = [
+    ['/private/var/', '/private/var/'], // 已经是 canonical，保持不变
+    ['/private/tmp/', '/private/tmp/'],
+    ['/private/etc/', '/private/etc/'],
+    ['/var/', '/private/var/'],
+    ['/tmp/', '/private/tmp/'],
+    ['/etc/', '/private/etc/'],
+  ]
+
+  // 只在 darwin 上做这个归一化。Linux 上 /var 和 /tmp 是真实目录，
+  // 归一化会把正确的路径改错。
+  if (process.platform !== 'darwin') return cwd
+
+  for (const [from, to] of prefixMap) {
+    if (cwd === from.slice(0, -1)) return to.slice(0, -1)
+    if (cwd.startsWith(from)) return to + cwd.slice(from.length)
+  }
+  return cwd
+}
+
+/**
  * 复刻 DSH 的 projectKey 编码（**仅用于构造路径，不要用它反解 cwd**）。
  *
  * 官方实现在 `projectKey()`：分隔符 `/` `\` `:` 合并成一个 `-`，其它不安全
@@ -400,10 +455,17 @@ export function projectKey(cwd) {
   if (typeof cwd !== 'string' || cwd.length === 0) {
     throw new TypeError('projectKey: cwd 必须是非空字符串')
   }
+  // ⚠️ 这里**刻意不做任何归一化**：DSH 自己的 `projectKey()` 是逐字符编码，
+  // 它不会 realpath，也不会合并 /var 与 /private/var。我们必须与它逐字符一致，
+  // 否则写出的目录名 DSH 自己算不出来 → 它找不到我们的会话。
+  //
+  // 同一目录的多种写法（软链）问题，改由**调用方在边界处统一**解决：
+  // 见 `sameCwd()` 与 `findSessionDirsByCwd()`，它们负责「用哪种写法都能找到」。
+  const normalized = cwd
   let readable = ''
   let separatorRun = false
-  for (let i = 0; i < cwd.length; i++) {
-    const ch = String.fromCharCode(cwd.charCodeAt(i))
+  for (let i = 0; i < normalized.length; i++) {
+    const ch = String.fromCharCode(normalized.charCodeAt(i))
     if (ch === '/' || ch === '\\' || ch === ':') {
       if (!separatorRun) readable += '-'
       separatorRun = true
@@ -411,7 +473,7 @@ export function projectKey(cwd) {
       readable += ch
       separatorRun = false
     } else {
-      readable += '~' + cwd.charCodeAt(i).toString(16).toUpperCase().padStart(4, '0')
+      readable += '~' + normalized.charCodeAt(i).toString(16).toUpperCase().padStart(4, '0')
       separatorRun = false
     }
   }
@@ -502,6 +564,101 @@ export function assertSafeSessionId(value, what = 'session id') {
     throw new PathEscapeError(`${what} 含非白名单字符（只允许 A-Z a-z 0-9 . _ -）：${JSON.stringify(value)}`)
   }
   return value
+}
+
+/**
+ * 给一个 cwd 生成「同一目录的所有可能写法」。
+ *
+ * ## 为什么需要
+ *
+ * `projectKey()` 是逐字符编码路径的，**不做任何归一化** —— 这是必须的，
+ * 因为 DSH 自己也这么做，我们必须与它逐字符一致，否则写出的目录名 DSH
+ * 算不出来、也就找不到我们的会话。
+ *
+ * 但代价是：同一个目录的两种写法（软链）会得到两个 projectKey。macOS 上
+ * `/tmp` → `/private/tmp`、`/var` → `/private/var`、`/etc` → `/private/etc`
+ * 是**系统级软链，不是罕见情况**。于是：
+ *
+ *   本机会话按 `/var/...` 落盘 → 查找时用 canonical `/private/var/...` 算 key
+ *   → 目录不存在 → 报「会话不存在」→ 追加静默失效。
+ *
+ * ## 解法：查找时不猜，把候选都试一遍
+ *
+ * 写入时用调用方给的字符串（与 DSH 一致）；**读取/查找时列出所有等价写法**，
+ * 逐个看目录是否存在。这样：
+ *   - 新数据不会分裂（写入仍然只有一个 key）
+ *   - 历史数据仍然找得到（查找会试多种写法）
+ *   - 不偏离 DSH 的编码规则
+ *
+ * 只列系统级软链的等价形式。用户自建软链需要真 `realpath`（异步 IO），
+ * 由调用方在有 IO 时通过 `options.cwdCandidates` 补充。
+ *
+ * @param {string} cwd 原始路径
+ * @returns {string[]} 去重后的候选路径列表，第一个总是原值
+ */
+export function cwdCandidates(cwd) {
+  if (typeof cwd !== 'string' || cwd === '') return []
+  const out = [cwd]
+  const push = (value) => {
+    if (typeof value === 'string' && value !== '' && !out.includes(value)) out.push(value)
+  }
+
+  if (process.platform === 'darwin') {
+    const forward = [
+      ['/var/', '/private/var/'],
+      ['/tmp/', '/private/tmp/'],
+      ['/etc/', '/private/etc/'],
+    ]
+    const backward = [
+      ['/private/var/', '/var/'],
+      ['/private/tmp/', '/tmp/'],
+      ['/private/etc/', '/etc/'],
+    ]
+    for (const [from, to] of forward) {
+      if (cwd === from.slice(0, -1)) push(to.slice(0, -1))
+      else if (cwd.startsWith(from)) push(to + cwd.slice(from.length))
+    }
+    for (const [from, to] of backward) {
+      if (cwd === from.slice(0, -1)) push(to.slice(0, -1))
+      else if (cwd.startsWith(from)) push(to + cwd.slice(from.length))
+    }
+  }
+  return out
+}
+
+/**
+ * 找出一个会话在本机所有可能的目录（因为 cwd 可能有多种写法）。
+ *
+ * 按 `cwdCandidates()` 逐个算 projectKey 并探测目录是否存在。
+ * 返回值按「第一个存在的」优先，便于调用方直接用 `[0]`。
+ *
+ * @param {string} sessionsRoot 会话根目录
+ * @param {string} sessionId 会话 id
+ * @param {string} cwd 会话 header 里的 cwd
+ * @param {{cwdCandidates?: string[]}} [options] 额外的候选 cwd（如真 realpath 的结果）
+ * @returns {Promise<string[]>} 存在的会话目录绝对路径，按存在性过滤
+ */
+export async function findSessionDirsByCwd(sessionsRoot, sessionId, cwd, options = {}) {
+  const root = resolve(sessionsRoot)
+  const idSegment = encodeSegment(assertSafeSessionId(sessionId, 'sessionId'))
+  const candidates = [...cwdCandidates(cwd), ...(options.cwdCandidates ?? [])]
+
+  const found = []
+  const seen = new Set()
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string' || candidate === '') continue
+    let dir
+    try {
+      dir = join(root, projectKey(candidate), idSegment)
+      assertInside(root, dir)
+    } catch {
+      continue
+    }
+    if (seen.has(dir)) continue
+    seen.add(dir)
+    if (await pathExists(dir)) found.push(dir)
+  }
+  return found
 }
 
 /**
@@ -1575,10 +1732,18 @@ export function encodeSessionLog(header, events, options = {}) {
 function defaultFrameEncoder(input) {
   const compress = zlib.zstdCompressSync
   if (typeof compress !== 'function') {
+    // 用 CORRUPT_SESSION 而不是 INTERNAL：对用户来说这不是"程序挂了"，
+    // 而是"这个环境写不出符合 DSH 格式的文件"。归到 data 类错误码后，
+    // engine 会把它当作系统性失败显式报出来，而不是吞成 internal-error。
     throw new SyncError(
-      ERROR_CODES.INTERNAL,
+      ERROR_CODES.CORRUPT_SESSION,
       `当前 Node ${process.version} 没有 zstd 压缩能力，无法安全地写出会话文件。`,
-      { hint: '请使用 Node ≥ 22.15 运行的 DSH。' }
+      {
+        hint:
+          '会话文件必须是带校验和的 zstd 帧序列，低版本 Node 无法生成。' +
+          '请用 Node ≥ 22.15 运行 DSH；升级前可以先只做上行（读取不需要压缩）。',
+        detail: { nodeVersion: process.version },
+      }
     )
   }
   return compress(input, { params: { [zlib.constants.ZSTD_c_checksumFlag]: 1 } })
@@ -1756,8 +1921,28 @@ export async function writeSession(payload, options) {
     backupPath = await snapshotSessionDir(sessionDir, backupDir, sessionId)
   }
 
-  // ── 写临时文件 → 校验 → 原子重命名 ──
+  // ── 创建会话目录 + 锁文件占位 ──
+  //
+  // 必须创建空的 `session.lock`，让目录结构与真实 DSH 会话完全一致。
+  //
+  // 为什么重要：`isSessionLive()` 的第一步是「没有 lock 文件 → 不可能有活跃
+  // 写入者 → 直接判 not-live」。如果我们写出的会话没有 lock，那么之后对它
+  // 的 LIVE 检测**永远短路成「不 live」**，于是用户正在 DSH 里使用它时，
+  // 我们仍会往里写 —— 正是 LIVE 检测要防的 DSH 内存态不一致。
+  //
+  // DSH 侧确认（从 shipped asar 的 `dsh-session-persistence-jsonl` 读到的
+  // `SessionWriteLease.acquire`）：它先 `mkdir(dir, {recursive:true})` 再
+  // `open(lockPath, 'w')`，而 `open(id,'write')` 分支**无条件**调用
+  // `acquireLease()`。所以 DSH 打开任意已有会话时都会把 lock 建出来。
+  // 这意味着盲区只持续到用户首次打开 —— 但我们不该依赖对方补建。
+  //
+  // 注意：**只创建文件，不加锁**。锁是 DSH 运行时的职责；我们抢锁会挡住
+  // 真正的写入者（这个判断在 isSessionLive 的注释里也写过）。
+  // 顺序上放在写日志之前：即使随后崩溃，目录结构也是合法的。
   await mkdir(sessionDir, { recursive: true })
+  await writeFile(join(sessionDir, LOCK_FILENAME), '')
+
+  // ── 写临时文件 → 校验 → 原子重命名 ──
   const tmpFile = join(sessionDir, `.session-${process.pid}-${Date.now()}.tmp`)
   try {
     await writeFile(tmpFile, bytes)
@@ -1790,6 +1975,15 @@ export async function writeSession(payload, options) {
   }
 
   // ── 写入后回读验证 ──
+  // 结构自检：目录里必须有 lock 文件，否则后续 LIVE 检测会永久失效。
+  if (!(await pathExists(join(sessionDir, LOCK_FILENAME)))) {
+    throw new SyncError(
+      ERROR_CODES.CORRUPT_SESSION,
+      `写入后的会话目录缺少 ${LOCK_FILENAME}，结构与真实 DSH 会话不一致。`,
+      { hint: '这会让后续的「会话是否正在使用」检测失效，属于内部错误。' }
+    )
+  }
+
   const verified = await readSessionDir(sessionDir, { frameDecoder: options.frameDecoder })
   if (verified.id !== sessionId) {
     throw new SyncError(
@@ -1878,17 +2072,52 @@ export async function appendToSession(payload, options) {
     throw new SyncError(ERROR_CODES.CORRUPT_SESSION, `会话 ${sessionId} 没有 cwd，无法定位。`)
   }
 
-  const dir = join(resolve(sessionsRoot), projectKey(effectiveCwd), encodeSegment(sessionId))
-  assertInside(resolve(sessionsRoot), dir)
-  const logFile = join(dir, currentLogFilename(true))
+  // 定位已有的会话目录。
+  //
+  // ⚠️ 关键：**必须用 `header.cwd` 定位，不能用 `cwdOverride`**。
+  //
+  // `cwdOverride` 的含义是「要把 header 里的 cwd 重写成什么」，用于跨机下行
+  // 纠正路径；而追加的前提是「这个会话本机已经有了」，它落在哪里由**它自己
+  // header 里记录的 cwd** 决定。
+  //
+  // 两者在软链路径下会算出不同的 projectKey。macOS 上实测：
+  //   header.cwd  = /tmp/x         → --tmp-x--
+  //   cwdOverride = /private/tmp/x → --private-tmp-x--
+  // 用 cwdOverride 定位就会找不到本该追加的会话并报 repo-path-missing。
+  // 这不只是测试环境的怪癖：用户把仓库放在任何软链路径下都会中招。
+  const locateCwd =
+    typeof header?.cwd === 'string' && header.cwd !== '' ? header.cwd : effectiveCwd
 
-  if (!(await pathExists(logFile))) {
+  // 用候选写法逐个探测真实位置。
+  //
+  // 为什么不能直接 `projectKey(locateCwd)`：macOS 上 /var 与 /private/var
+  // 是同一目录的两种写法，`projectKey` 会给出两个不同的目录名。如果本机会话
+  // 当初是按另一种写法落盘的，直接算就会找不到它 —— 表现是「会话不存在，
+  // 无法追加」，而实际上是同一个会话。
+  //
+  // 写入仍然只用一个 key（与 DSH 逐字符一致），只有**查找**才试多种写法。
+  const candidates = await findSessionDirsByCwd(
+    sessionsRoot,
+    sessionId,
+    locateCwd,
+    { cwdCandidates: options.cwdCandidates },
+  )
+  if (candidates.length === 0) {
+    const dir = join(resolve(sessionsRoot), projectKey(locateCwd), encodeSegment(sessionId))
+    assertInside(resolve(sessionsRoot), dir)
+    if (!(await pathExists(join(dir, currentLogFilename(true))))) {
     throw new SyncError(
       ERROR_CODES.REPO_PATH_MISSING,
-      `会话 ${sessionId} 在本机不存在，无法追加；应改用 writeSession 整体写入。`,
-      { hint: '这通常意味着引擎的增量判定与本机状态不一致。' }
-    )
+        `会话 ${sessionId} 在本机不存在，无法追加；应改用 writeSession 整体写入。`,
+        { hint: '这通常意味着引擎的增量判定与本机状态不一致。' }
+      )
+    }
   }
+
+  const dir = candidates.length > 0
+    ? candidates[0]
+    : join(resolve(sessionsRoot), projectKey(locateCwd), encodeSegment(sessionId))
+  const logFile = join(dir, currentLogFilename(true))
 
   // ── LIVE 检查：绝不给运行中的会话追加 ──
   if (options.skipLiveCheck !== true) {
@@ -1980,6 +2209,14 @@ export async function appendToSession(payload, options) {
 
   // ── 备份（追加同样要能回滚）──
   const backupPath = await snapshotSessionDir(dir, backupDir, sessionId)
+
+  // 补齐 lock 文件：老版本写出的会话（或异常情况）可能没有它。
+  // 缺 lock 会让后续 LIVE 检测永久失效，所以这里顺手修复目录结构。
+  const lockPath = join(dir, LOCK_FILENAME)
+  if (!(await pathExists(lockPath))) {
+    await writeFile(lockPath, '')
+    options.log?.warn?.('session.append.created-missing-lock', { sessionId })
+  }
 
   // ── 追加：截掉 torn tail → 写新帧 → fsync ──
   const handle = await open(logFile, 'r+')

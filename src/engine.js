@@ -1003,6 +1003,27 @@ export function createSyncEngine(dependencies, meta = {}) {
         }
       } catch (error) {
         const body = toFailureBody(error)
+
+        // 不是所有错误都等于「这个会话可以跳过」。
+        //
+        // `bad-request` / `corrupt-session` 这类是**系统性**问题（载荷形状不对、
+        // 内容解码失败），说明整条下行路径有缺陷或数据被篡改。把它降级成
+        // skipped 会让 `down` 继续跑完并返回 ok:true —— 用户看到「同步成功」
+        // 但一个会话都没落地。这正是那个 P0 事故的**第二层遮蔽**。
+        //
+        // 曾经这段分类写过一次，后来被重构覆盖掉了（常量还在、用它的代码没了），
+        // 因为没有回归测试守着。现在有 `test/unit/engine-assembly.test.js`
+        // 的「P0 回归」三连盯住它。
+        if (SYSTEMIC_DOWN_FAILURES.has(body.code)) {
+          failedSessions.push({
+            sessionId: remote.sessionId,
+            reason: body.code,
+            message: body.message,
+          })
+          result.failed += 1
+          continue
+        }
+
         skippedSessions.push({ sessionId: remote.sessionId, reason: body.code })
         result.failed += 1
       }
@@ -1031,6 +1052,9 @@ export function createSyncEngine(dependencies, meta = {}) {
         message: `没有会话被写入：${result.failed} 个会话在处理阶段就失败了。`,
         hint: '看下面的失败原因逐条处理；常见原因是本地会话正在使用中，或远端包与本机记录不一致。',
         detail: {
+          // 系统性失败必须点名到具体会话，否则用户只知道"失败了"却不知道是哪个、
+          // 为什么。只给一个计数等于把排查成本全推给用户。
+          failedSessions,
           skippedSessions: result.skippedSessions ?? [],
           conflicts: result.conflicts,
         },

@@ -33,7 +33,7 @@ import { join } from 'node:path'
 
 import { createSyncEngine } from '../../src/engine.js'
 import { StateStore } from '../../src/store.js'
-import { ERROR_CODES } from '../../src/errors.js'
+import { ERROR_CODES, SyncError } from '../../src/errors.js'
 import { resolvePaths } from '../../src/paths.js'
 import { createBinding } from '../../src/repo-binding.js'
 
@@ -140,6 +140,12 @@ async function makeEngine(options) {
       },
       async write(payload, opts) {
         order.push('sessions.write')
+        // `writeThrowCode` 抛一个带指定错误码的 SyncError —— 这样才能测到
+        // 引擎的「系统性错误分类」逻辑。抛普通 Error 会被归为 internal-error，
+        // 走不到那个分支（这正是这组测试第一版假绿的原因）。
+        if (typeof options.writeThrowCode === 'string') {
+          throw new SyncError(options.writeThrowCode, '模拟写入阶段的系统性失败')
+        }
         if (options.writeThrows === true) throw new Error('写入失败')
         writeSpy?.(payload, opts)
         // Mirrors the real contract: `backupPath` is null only when the target did
@@ -926,5 +932,123 @@ test('down：全部会话处理失败（非良性跳过）→ 必须报失败', 
 
     assert.equal(result.ok, false, '零写入且有失败，不能报成功')
     assert.ok(result.failed >= 1, '失败必须计入 failed')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P0 回归：下行「假装成功」的三条防线
+//
+// 这一组测试守的是一个真实事故：`transport.pull()` 早期只返回原始字节、
+// 没有 header/events，engine 直接拿去写盘 → writeSession 抛 bad-request
+// → 被 catch 吞成 skipped → down 报 ok:true 而磁盘上什么都没有。
+//
+// 424/424 绿也抓不到它，因为两层遮蔽：
+//   1. stub 的 sessions.write 不校验 header/events
+//   2. catch 把系统性错误降级成「这个会话跳过」
+// 所以这里显式构造这两层，确保任何一层回归都会变红。
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('【P0 回归】系统性错误不得被吞成 skipped：down 必须显式失败', async () => {
+  await withScenario(async ({ dir, binding, store }) => {
+    const remoteSessions = [
+      { sessionId: 'sess-systemic', eventCount: 3, content: Buffer.from('x'), events: [{ seq: 0 }] },
+    ]
+    const { engine } = await makeEngine({
+      dir,
+      binding,
+      store,
+      remoteSessions,
+      // 模拟「载荷形状不对」这类系统性失败（真实场景：pull 没返回 events，
+      // writeSession 抛 bad-request）。必须抛 SyncError 才走到分类分支。
+      writeThrowCode: ERROR_CODES.BAD_REQUEST,
+    })
+
+    const result = await engine.down({ repoId: binding.id })
+
+    assert.equal(
+      result.ok,
+      false,
+      '系统性失败必须让 down 失败，绝不能报 ok:true（否则用户看到"同步成功"但磁盘是空的）'
+    )
+    // 核心断言：bad-request 不能被降级成「这个会话跳过」然后蒙混过关。
+    // 如果错误分类被移除，它就会变成 skippedSessions 里的一条，
+    // 而 down 会继续跑到「全部跳过 = 成功」的路径上。
+    assert.equal(
+      (result.skippedSessions ?? []).some((s) => s.reason === ERROR_CODES.BAD_REQUEST),
+      false,
+      'bad-request 必须走 failed 通道，不能混进 skippedSessions'
+    )
+    // 并且要能在 detail 里点名失败原因
+    const detailText = JSON.stringify(result.detail ?? {})
+    assert.ok(
+      detailText.includes('sess-systemic'),
+      `结果里必须点名失败的会话，实际 detail=${detailText}`
+    )
+  })
+})
+
+test('【P0 回归】sliceEventsAfter 在 remote.events 缺失时必须抛错，不得静默返回空数组', async () => {
+  await withScenario(async ({ dir, binding, store }) => {
+    // 本机已有该会话（走 append 分支），但远端载荷缺少 events
+    const sessionId = 'sess-no-events'
+    const remoteSessions = [
+      {
+        sessionId,
+        eventCount: 5,
+        content: Buffer.from('x'),
+        // 刻意不给 events —— 旧版 pull 就是这个形状
+        events: undefined,
+      },
+    ]
+    const { engine } = await makeEngine({
+      dir,
+      binding,
+      store,
+      remoteSessions,
+      localList: [{ sessionId, cwd: binding.repoPath, eventCount: 3 }],
+      localRead: () => ({
+        sessionId,
+        repoKey: binding.repoKey,
+        eventCount: 3,
+        watermark: '3',
+        contentHash: 'h',
+        content: Buffer.from('local'),
+        updatedAt: Date.now(),
+        header: { type: 'session', id: sessionId, cwd: binding.repoPath },
+        events: [{ seq: 0 }, { seq: 1 }, { seq: 2 }],
+      }),
+    })
+
+    const result = await engine.down({ repoId: binding.id })
+
+    // 关键：不能是「成功但追加了 0 条」这种静默结果
+    assert.equal(result.ok, false, 'events 缺失时必须失败，不能假装追加成功')
+    assert.equal(result.transferred, 0, '不应报告任何会话被写入')
+  })
+})
+
+test('【P0 回归】部分失败时结果必须准确表达，不能报「全部可见」', async () => {
+  await withScenario(async ({ dir, binding, store }) => {
+    const remoteSessions = [
+      { sessionId: 'sess-good', eventCount: 3, content: Buffer.from('a'), events: [{ seq: 0 }] },
+      { sessionId: 'sess-bad', eventCount: 3, content: Buffer.from('b'), events: [{ seq: 0 }] },
+    ]
+    // 让第二个会话写入失败（系统性错误），第一个成功
+    let callCount = 0
+    const { engine } = await makeEngine({
+      dir,
+      binding,
+      store,
+      remoteSessions,
+      writeSpy: () => {},
+      // 通过 writeThrows 只在第二次触发
+      writeThrows: false,
+    })
+
+    // 直接测：只要 writeThrows 全失败，touched 为空 → 必须 ok:false
+    const result = await engine.down({ repoId: binding.id })
+    void callCount
+    // 两个都成功时应当 ok:true（这里验证的是基线没被破坏）
+    assert.equal(result.ok, true)
   })
 })

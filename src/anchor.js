@@ -75,8 +75,13 @@ export async function captureAnchor(repoPath, options = {}) {
       ],
       'capture-anchor:head'
     ),
-    // 脏文件数：只用于展示「当时工作区有 N 个未提交改动」，不参与任何判断。
-    git(repoPath, ['status', '--porcelain', '--untracked-files=no'], {
+    // 脏文件数：展示「当时工作区有 N 个未提交改动」，不参与任何判断。
+    //
+    // **必须包含 untracked 文件**：一个刚写还没 `git add` 的新文件，对用户
+    // 来说同样是"当时工作区里有未提交的东西"，排除它会让这个数字系统性偏小。
+    // 实测：工作区里只有一个新文件时，`--untracked-files=no` 返回空、
+    // 报 dirtyCount=0 —— 那是在对用户撒谎。
+    git(repoPath, ['status', '--porcelain', '--untracked-files=normal'], {
       allowFailure: true,
       timeoutMs: ANCHOR_GIT_TIMEOUT_MS,
     }),
