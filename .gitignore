@@ -1,5 +1,66 @@
+# ─────────────────────────────────────────────────────────────
+# dsh-repo-session-sync — 严格忽略规则
+# 原则：本仓库只放「插件源码」。任何与本机环境、用户数据、
+# 真实会话、凭据有关的东西一律不提交。
+# ─────────────────────────────────────────────────────────────
+
+# 依赖与构建产物
 node_modules/
-*.log
-.DS_Store
+dist/
+build/
+*.tgz
 coverage/
+.pnpm-store/
+
+# 日志与临时文件
+*.log
+logs/
 .tmp/
+tmp/
+*.tmp
+*.bak
+*.swp
+*~
+
+# ── 用户真实数据：绝对禁止提交 ──
+# DSH 会话、附件、存储、凭据可能是通过软链或调试残留进来的
+.dsh/
+sessions/
+attachments/
+storages/
+.credentials.yaml
+credentials.yaml
+*.credentials.*
+
+# 凭据与密钥
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+id_ecdsa*
+known_hosts
+*.keystore
+secrets.json
+secret.json
+
+# 测试夹具里的真实机器信息（我们自己的测试数据必须是合成的）
+test/fixtures/local/
+test/fixtures/private/
+test/.real-*/
+real-home/
+*.real.json
+
+# ── 本机专属绝对路径痕迹 ──
+# 禁止出现 /Users/gzp/... 之类的真实家目录路径被打进源码
+# （由 commit-msg / 提交前扫描脚本兜底检查，见 scripts/check-private.sh）
+
+# 编辑器与系统
+.DS_Store
+.idea/
+.vscode/
+*.iml
