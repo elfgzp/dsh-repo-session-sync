@@ -25,9 +25,10 @@
  *   - 所有路径拼接前都经过 assertInside()，防穿越
  */
 
+import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { readdir, readFile, stat } from 'node:fs/promises'
-import { resolve, sep } from 'node:path'
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { join, resolve, sep } from 'node:path'
 import zlib from 'node:zlib'
 
 import { ERROR_CODES, SyncError } from './errors.js'
@@ -53,6 +54,9 @@ const LOG_FILENAME_RE = /^session(?:\.v(\d+))?\.jsonl(\.zstd)?$/
 
 /** 无 cwd 会话落在该目录。 */
 const NO_CWD_DIR = '_no-cwd'
+
+/** DSH 的会话写锁文件名（0 字节的 flock 目标）。 */
+const LOCK_FILENAME = 'session.lock'
 
 /**
  * 单个会话日志的大小上限。超过就拒绝读取，避免恶意/损坏文件把内存打爆。
@@ -837,6 +841,19 @@ export async function readSessionHeaderOnly(sessionDir, options = {}) {
     )
   }
 
+  // 顺带扫一次帧边界：DSH 的落盘约定是「每个 durable append 一批写一帧」，
+  // header 独占首帧，所以 `帧数 - 1` 是一个**廉价的事件数上界**（真实事件数
+  // 只会 >= 它，因为一批可能含多个事件）。这比为了数事件而解压整个文件便宜
+  // 得多（扫帧不解压），足够支撑 list() 的展示与「有没有新事件」的粗判断。
+  // 精确事件数由 read() 走完整解析得到。
+  let frameCount = null
+  try {
+    const scanned = scanZstdFrames(raw)
+    frameCount = scanned.frames.length
+  } catch {
+    frameCount = null
+  }
+
   return {
     dir,
     id: header.id,
@@ -844,6 +861,9 @@ export async function readSessionHeaderOnly(sessionDir, options = {}) {
     logFile,
     logBytes: raw.length,
     contentHash: createHash('sha256').update(raw).digest('hex'),
+    frameCount,
+    // 帧数 - 1 = 至少这么多批 append；仅作估算，精确值靠 read()
+    estimatedEventCount: frameCount === null ? null : Math.max(0, frameCount - 1),
   }
 }
 
@@ -885,6 +905,159 @@ export function sessionBelongsToRepo(session, repoPath) {
   const repo = normalizeRepoPath(repoPath)
   if (sessionCwd === repo) return true
   return sessionCwd.startsWith(repo + sep) || sessionCwd.startsWith(repo + '/')
+}
+
+/**
+ * 把一个会话数组按「父子闭包」分组。
+ *
+ * ## 为什么需要它
+ *
+ * 实测 218 个真实会话里有 151 个是子会话（`parentSession` 指向父会话），
+ * 占 69%。子会话是父会话推理过程的组成部分 —— 缺了它，用户回到另一台机器
+ * 打开父会话时，"这个结论是哪个子代理做出来的"这段信息就丢了。
+ * 所以同步的**单元不是单个会话，而是会话闭包**：一个顶层会话加上它全部后代。
+ *
+ * ## 判定规则（刻意保守）
+ *
+ * **是子会话 ⟺ header.parentSession 是非空字符串。** 只看这一个字段。
+ *
+ * 不把 `origin === 'subagent'` 当作必要条件，也不看 `delegationDepth`：
+ * `origin` 在 DSH 的 header 校验里是可选字段，`delegationDepth` 是展示用的
+ * 深度信息。而 `parentSession` 存在本身就是「我有父」的充分条件 ——
+ * 把判定建立在充分条件上，比建立在当前实现的惯例上更抗变化。
+ *
+ * 也不靠「目录名有没有 session- 前缀」判断：实测 218/218 吻合，但那是观测
+ * 不是契约（qa 也独立确认了这一点）。
+ *
+ * ## 孤儿处理
+ *
+ * `parentSession` 指向的会话不在传入数组里时，该会话**自成闭包**，
+ * 但在结果里用 `orphan: true` 标记，让上层能给出可读警告而不是静默通过。
+ * 实测真实数据里孤儿数为 0，所以正常流程不该出现。
+ *
+ * @param {Array<{id?: string, header?: {id?: string, parentSession?: string}}>} sessions
+ *   会话记录数组；每个元素至少要有 `id`（或 `header.id`）与 `header`
+ * @returns {Array<{
+ *   root: string, members: string[], descendants: string[],
+ *   orphan: boolean, missingParent: string | null
+ * }>} 闭包列表，每个闭包以顶层（无父）会话为 root
+ */
+export function groupSessionClosures(sessions) {
+  if (!Array.isArray(sessions)) {
+    throw new SyncError(ERROR_CODES.BAD_REQUEST, 'groupSessionClosures 需要数组')
+  }
+
+  /** id → 记录 */
+  const byId = new Map()
+  for (const record of sessions) {
+    const id = record?.id ?? record?.header?.id
+    if (typeof id !== 'string' || id === '') continue
+    byId.set(id, record)
+  }
+
+  /** 父 id → 子 id 列表 */
+  const childrenOf = new Map()
+  /** id → 父 id */
+  const parentOf = new Map()
+
+  for (const [id, record] of byId) {
+    const parent = record?.header?.parentSession
+    if (typeof parent === 'string' && parent !== '') {
+      parentOf.set(id, parent)
+      if (!childrenOf.has(parent)) childrenOf.set(parent, [])
+      childrenOf.get(parent).push(id)
+    }
+  }
+
+  /**
+   * 向上追溯到顶层会话。
+   *
+   * 要防环：虽然 DSH 不会产生环，但这是**不可信输入可能构造的形态**
+   * （远端载荷里的 header 是别人写的），沿环走会死循环。
+   */
+  const resolveRoot = (id) => {
+    const seen = new Set()
+    let current = id
+    for (;;) {
+      if (seen.has(current)) {
+        // 检测到环：把这个 id 当作顶层，避免挂死
+        return { root: id, cycled: true }
+      }
+      seen.add(current)
+      const parent = parentOf.get(current)
+      if (parent === undefined) return { root: current, cycled: false }
+      // 父不在传入集合里 → 本会话是孤儿，自成顶层
+      if (!byId.has(parent)) return { root: current, cycled: false, missingParent: parent }
+      current = parent
+    }
+  }
+
+  /** root id → 闭包 */
+  const closures = new Map()
+  /** 已被某个闭包收编的 id，避免环导致的重复归属 */
+  const claimed = new Set()
+
+  for (const id of byId.keys()) {
+    const { root, missingParent } = resolveRoot(id)
+    let closure = closures.get(root)
+    if (closure === undefined) {
+      closure = {
+        root,
+        members: [],
+        descendants: [],
+        orphan: false,
+        missingParent: null,
+      }
+      closures.set(root, closure)
+    }
+    if (!claimed.has(id)) {
+      claimed.add(id)
+      closure.members.push(id)
+      if (id !== root) closure.descendants.push(id)
+    }
+    if (missingParent !== undefined && missingParent !== null) {
+      closure.orphan = true
+      closure.missingParent = missingParent
+    }
+  }
+
+  // 稳定输出：先按 root 名排序，成员也排序，便于测试与 diff
+  return [...closures.values()]
+    .map((closure) => ({
+      ...closure,
+      members: [...closure.members].sort(),
+      descendants: [...closure.descendants].sort(),
+    }))
+    .sort((a, b) => a.root.localeCompare(b.root))
+}
+
+/**
+ * 找出「父会话既不在本机、也不在本批次」的会话。
+ *
+ * 用于下行后的完整性校验：返回的不是错误而是警告清单 —— 用户可能有意
+ * 只同步部分会话，硬失败会让合法操作做不了。
+ *
+ * @param {Array<{id?: string, header?: {parentSession?: string}}>} incoming 远端来的会话
+ * @param {Iterable<string>} presentLocalIds 本机已有的会话 id
+ * @returns {Array<{id: string, missingParent: string}>} 需要提示的会话
+ */
+export function findMissingParents(incoming, presentLocalIds) {
+  const local = presentLocalIds instanceof Set ? presentLocalIds : new Set(presentLocalIds)
+  const incomingIds = new Set()
+  for (const record of incoming) {
+    const id = record?.id ?? record?.header?.id
+    if (typeof id === 'string' && id !== '') incomingIds.add(id)
+  }
+
+  const missing = []
+  for (const record of incoming) {
+    const id = record?.id ?? record?.header?.id
+    const parent = record?.header?.parentSession
+    if (typeof id !== 'string' || typeof parent !== 'string' || parent === '') continue
+    if (local.has(parent) || incomingIds.has(parent)) continue
+    missing.push({ id, missingParent: parent })
+  }
+  return missing
 }
 
 /**
@@ -1178,5 +1351,738 @@ export function assertNotCredentialPath(path) {
     }
   }
 }
+
+// ─────────────────────────────────────────────────────────────
+// LIVE 会话检测 —— 拒绝写入正在被 DSH 使用的会话
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * DSH 用 `<会话目录>/session.lock` 上的 `flock(2)` **排他**咨询锁来表示
+ * 「这个会话正被某个写入者持有」。语义（读自 DSH 的 persistence 源码）：
+ *
+ *   - 由内核仲裁，**持有者进程一死锁就自动释放** —— 所以不会因为崩溃而
+ *     永久卡住一个会话；
+ *   - 读者从不碰这个锁，所以「探测它是否被持有」不会干扰 DSH；
+ *   - 锁文件本身**永不删除**（释放时只关 fd），所以文件存在 ≠ 被持有。
+ *
+ * ## 为什么必须检测
+ *
+ * 下行写入一个**正在运行**的会话，会让 DSH 内存里的 next-seq 与磁盘不一致，
+ * 后续写入要么被拒、要么产生 seq 冲突 —— 这是本项目里唯一会破坏
+ * 用户数据一致性的操作。宁可不写，也不能写坏。
+ *
+ * ## 探测手段（多平台后备）
+ *
+ * Node 没有内置 flock。按可靠性依次尝试：
+ *
+ *   1. **`lsof`**（macOS / Linux 都有）：列出持有该文件的进程。
+ *      实测在 macOS 上准确：无持有者时无输出，持有期间能列出，
+ *      持有者退出后恢复无输出。
+ *   2. **`fuser`**（Linux 常见）：同上思路。
+ *   3. 都不可用时返回 `live: false, checked: false` —— **明确表示没查成**，
+ *      让上层决定是否放行，而不是假装「不 live」。
+ *
+ * 注意：这里**不去尝试自己 flock**。原因是我们不该去抢 DSH 的锁——
+ * 抢不到会阻塞、侥幸抢到反而会把真的写入者挡住。只观察、不干预。
+ *
+ * @param {string} sessionDir 会话目录
+ * @param {{execFile?: Function, timeoutMs?: number}} [options] 测试注入
+ * @returns {Promise<{live: boolean, checked: boolean, reason?: string, method?: string}>}
+ */
+export async function isSessionLive(sessionDir, options = {}) {
+  const dir = resolve(sessionDir)
+  const lockFile = join(dir, LOCK_FILENAME)
+
+  // 锁文件不存在 → 这个会话从未被 materialize，不可能有活跃写入者
+  if (!(await pathExists(lockFile))) {
+    return { live: false, checked: true, method: 'no-lock-file' }
+  }
+
+  const runner = options.execFile ?? defaultExecFile
+  const timeoutMs = options.timeoutMs ?? 5_000
+
+  // ── 1) lsof ──
+  const lsof = await runner('lsof', ['--', lockFile], { timeoutMs })
+  if (lsof.available) {
+    if (lsof.code !== 0) {
+      // lsof 的返回码 1 表示「没有进程打开该文件」—— 这是正常的「未被持有」
+      return { live: false, checked: true, method: 'lsof' }
+    }
+    const output = String(lsof.stdout ?? '')
+    // lsof 输出：首行表头，之后每行一个持有者（COMMAND PID USER FD TYPE ...）
+    const lines = output
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+    const holders = lines.slice(1)
+    if (holders.length === 0) {
+      return { live: false, checked: true, method: 'lsof' }
+    }
+    // 只取命令名与 PID，别把整行 lsof 表格塞进用户提示里
+    const summary = holders
+      .map((line) => {
+        const parts = line.split(/\s+/)
+        return parts.length >= 2 ? `${parts[0]}(pid ${parts[1]})` : parts[0]
+      })
+      .slice(0, 3)
+      .join(', ')
+    return {
+      live: true,
+      checked: true,
+      method: 'lsof',
+      reason: `会话正被其他进程打开（${summary}），写入会导致 DSH 内存状态与磁盘不一致`,
+    }
+  }
+
+  // ── 2) fuser ──
+  const fuser = await runner('fuser', ['--', lockFile], { timeoutMs })
+  if (fuser.available) {
+    if (fuser.code !== 0) return { live: false, checked: true, method: 'fuser' }
+    return {
+      live: true,
+      checked: true,
+      method: 'fuser',
+      reason: '会话正被其他进程打开，写入会导致 DSH 内存状态与磁盘不一致',
+    }
+  }
+
+  // ── 3) 都不可用：明确报告「没查成」 ──
+  return {
+    live: false,
+    checked: false,
+    reason: '当前系统既没有 lsof 也没有 fuser，无法判断会话是否正在运行',
+  }
+}
+
+/**
+ * 调用外部命令并区分「命令不存在」与「执行失败」。
+ *
+ * @param {string} command
+ * @param {string[]} args
+ * @param {{timeoutMs: number}} options
+ * @returns {Promise<{available: boolean, code: number, stdout: string, stderr: string}>}
+ */
+function defaultExecFileImpl(command, args, options) {
+  return new Promise((resolvePromise) => {
+    execFile(
+      command,
+      args,
+      {
+        timeout: options.timeoutMs,
+        killSignal: 'SIGKILL',
+        windowsHide: true,
+        maxBuffer: 4 * 1024 * 1024,
+        encoding: 'utf8',
+      },
+      (error, stdout, stderr) => {
+        if (error && /** @type {NodeJS.ErrnoException} */ (error)?.code === 'ENOENT') {
+          resolvePromise({ available: false, code: 127, stdout: '', stderr: '' })
+          return
+        }
+        const code =
+          error === null || error === undefined
+            ? 0
+            : typeof error.code === 'number'
+              ? error.code
+              : 1
+        resolvePromise({
+          available: true,
+          code,
+          stdout: String(stdout ?? ''),
+          stderr: String(stderr ?? ''),
+        })
+      }
+    )
+  })
+}
+
+/** 探测锁时注入口（测试可替换）。 */
+let defaultExecFile = defaultExecFileImpl
+
+/**
+ * 替换锁探测用的命令执行器（仅测试使用）。
+ *
+ * @param {Function} impl
+ */
+export function setLockProbeRunner(impl) {
+  defaultExecFile = impl ?? defaultExecFileImpl
+}
+
+// ─────────────────────────────────────────────────────────────
+// 写入：下行落盘
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 把一组已解析的事件重新编码成 DSH 的落盘字节。
+ *
+ * 用途只有一个：**下行时重写 header 的 cwd**。因为 `attachSession()` 会
+ * 硬校验 `realpath(header.cwd) === workspace.path`，A 机的路径到 B 机必然
+ * 不匹配，不重写就 100% 被 registry 过滤掉（用户看到「同步成功」但侧栏空白
+ * —— 这是比报错更糟的结果）。
+ *
+ * 重写会改变字节，所以**必须重新算 contentHash**；跨机判重不能用字节指纹，
+ * 要用 `conflict.js` 的逻辑指纹（它排除 cwd）。
+ *
+ * 编码方式刻意与 DSH 一致：header 独占首帧，每个事件一帧。
+ * 这样本模块自己写出来的文件能被 `readSessionDir()` 原样读回，
+ * 也能被 `sliceByByteWatermark()` 按帧边界切分。
+ *
+ * @param {object} header 原始 header 对象
+ * @param {object[]} events 事件数组（seq 必须从 0 连续）
+ * @param {{cwdOverride?: string, frameEncoder?: (buf: Buffer) => Buffer}} [options]
+ * @returns {Buffer} 可直接落盘的字节
+ * @throws {SyncError} 事件 seq 不连续或无法编码
+ */
+export function encodeSessionLog(header, events, options = {}) {
+  assertValidHeader(header)
+  if (!Array.isArray(events)) {
+    throw new SyncError(ERROR_CODES.BAD_REQUEST, 'encodeSessionLog 需要事件数组。')
+  }
+  for (const [i, event] of events.entries()) {
+    if (event?.seq !== i) {
+      throw new SyncError(
+        ERROR_CODES.CORRUPT_SESSION,
+        `编码前 seq 不连续：第 ${i} 个事件期望 seq=${i}，实际 ${event?.seq}`,
+        { hint: '内部错误：事件流在写入前就已经不连续。' }
+      )
+    }
+  }
+
+  const nextHeader = { ...header }
+  if (typeof options.cwdOverride === 'string' && options.cwdOverride !== '') {
+    nextHeader.cwd = options.cwdOverride
+  }
+
+  const encodeFrame = options.frameEncoder ?? defaultFrameEncoder
+  const frames = [encodeFrame(Buffer.from(JSON.stringify(nextHeader) + '\n', 'utf8'))]
+  for (const event of events) {
+    frames.push(encodeFrame(Buffer.from(JSON.stringify(event) + '\n', 'utf8')))
+  }
+  return Buffer.concat(frames)
+}
+
+/**
+ * 默认帧编码器：用 Node 原生 zstd 压成带校验和的独立帧（与 DSH 一致）。
+ *
+ * 没有原生压缩能力时**明确报错**而不是退化 —— 退回未压缩会写出与 DSH
+ * 不一致的文件，而这是我们主动写用户真实数据，不能有"差不多"。
+ *
+ * @param {Buffer} input
+ * @returns {Buffer}
+ */
+function defaultFrameEncoder(input) {
+  const compress = zlib.zstdCompressSync
+  if (typeof compress !== 'function') {
+    throw new SyncError(
+      ERROR_CODES.INTERNAL,
+      `当前 Node ${process.version} 没有 zstd 压缩能力，无法安全地写出会话文件。`,
+      { hint: '请使用 Node ≥ 22.15 运行的 DSH。' }
+    )
+  }
+  return compress(input, { params: { [zlib.constants.ZSTD_c_checksumFlag]: 1 } })
+}
+
+/**
+ * 写入一个下载下来的会话。
+ *
+ * ## 安全顺序（顺序本身就是安全，不能重排）
+ *
+ *   1. **校验目标路径**：不落在凭据路径、pid 是安全段名
+ *   2. **快照**：目标已存在则先整目录复制到备份区，且**回读验证**备份可读
+ *   3. 备份失败 → **抛 `backup-failed` 并中止**，一个字节都不写
+ *   4. 写临时文件 → 校验能读回 → **原子重命名**到目标
+ *   5. 写入后回读验证能解析、seq 连续
+ *
+ * 第 4 步用「临时文件 + rename」而不是直接覆盖：rename 在同一文件系统上是
+ * 原子的，所以中途崩溃不会留下半个日志文件；读取方要么看到旧文件、要么
+ * 看到新文件。
+ *
+ * ## 为什么不是「追加」
+ *
+ * 追加只适用于「本机已有该会话且远端是它的延续」的情形，那由引擎在
+ * 调用本函数**之前**用 `classifyIncoming()` 判定，并且走 `appendToSession()`。
+ * 本函数处理的是「本机没有 / 需要整体替换」的情形。
+ *
+ * @param {object} payload `{sessionId, header, events, ...}`
+ * @param {{sessionsRoot: string, backupDir: string, cwdOverride?: string, dryRun?: boolean, frameEncoder?: Function}} options
+ * @returns {Promise<{written: string[], skipped: string[], backupPath: string|null, sessionId: string, contentHash: string|null, dryRun: boolean}>}
+ */
+export async function writeSession(payload, options) {
+  // 兼容两种调用形态：
+  //   (a) writeSession(payload, { sessionsRoot, backupDir, ... })   ← 主签名，显式
+  //   (b) writeSession({ dshHome, sessionId, cwd, rounds, ... })    ← 便捷形态，
+  //       测试与工具脚本更愿意用它（不用自己拼 header/events）
+  //
+  // 便捷形态只在**没有第二个参数**时启用，避免两种形态混杂时产生歧义。
+  if (options === undefined && payload !== null && typeof payload === 'object' && payload.dshHome !== undefined) {
+    payload = materializeConveniencePayload(payload)
+    options = {
+      sessionsRoot: join(resolve(payload.dshHome), 'sessions'),
+      backupDir: join(resolve(payload.dshHome), 'repo-session-sync', 'backups'),
+      lockProbeRunner: payload.lockProbeRunner,
+      dryRun: payload.dryRun === true,
+      skipLiveCheck: payload.skipLiveCheck === true,
+    }
+  }
+
+  const { sessionsRoot, backupDir, cwdOverride, dryRun = false } = options ?? {}
+  if (typeof sessionsRoot !== 'string' || sessionsRoot === '') {
+    throw new SyncError(ERROR_CODES.BAD_REQUEST, 'writeSession 需要 sessionsRoot。')
+  }
+  if (typeof backupDir !== 'string' || backupDir === '') {
+    throw new SyncError(ERROR_CODES.BAD_REQUEST, 'writeSession 需要 backupDir —— 无备份不写入。')
+  }
+
+  const sessionId = assertSafeSessionId(payload?.sessionId, '待写入 sessionId')
+  assertNotCredentialPath(sessionsRoot)
+  assertNotCredentialPath(backupDir)
+
+  const header = payload?.header
+  const events = payload?.events
+  if (header === null || typeof header !== 'object') {
+    throw new SyncError(ERROR_CODES.BAD_REQUEST, `会话 ${sessionId} 缺少 header。`)
+  }
+  if (!Array.isArray(events)) {
+    throw new SyncError(ERROR_CODES.BAD_REQUEST, `会话 ${sessionId} 缺少 events。`)
+  }
+  if (header.id !== sessionId) {
+    throw new SyncError(
+      ERROR_CODES.CORRUPT_SESSION,
+      `会话 id 不一致：参数是 ${sessionId}，header 里是 ${header.id}。`
+    )
+  }
+
+  // cwd 是必填的：没有 cwd 的会话 DSH 无法校验归属，写进去也看不见
+  const effectiveCwd = typeof cwdOverride === 'string' && cwdOverride !== ''
+    ? cwdOverride
+    : header.cwd
+  if (typeof effectiveCwd !== 'string' || effectiveCwd === '') {
+    throw new SyncError(
+      ERROR_CODES.CORRUPT_SESSION,
+      `会话 ${sessionId} 没有 cwd，写入后无法被 DSH 的 workspace 收录。`,
+      { hint: '请确认远端会话带有 cwd，或为本机配置目标仓库路径。' }
+    )
+  }
+
+  // 落点：<sessionsRoot>/<projectKey(cwd)>/<encodeSegment(id)>/session.v4.jsonl.zstd
+  const projectDir = join(resolve(sessionsRoot), projectKey(effectiveCwd))
+  assertInside(resolve(sessionsRoot), projectDir)
+  const sessionDir = join(projectDir, encodeSegment(sessionId))
+  assertInside(resolve(sessionsRoot), sessionDir)
+  const logFile = join(sessionDir, currentLogFilename(true))
+
+  const existed = await pathExists(sessionDir)
+
+  // ── 关键防线：拒绝写入正在被 DSH 使用的会话 ──
+  //
+  // 位置很讲究，三重理由：
+  //   1. 在**编码之前** —— 编码要压缩全部事件，是最贵的步骤；已经知道不能写
+  //      就没必要先花这份开销。
+  //   2. 在**备份之前** —— LIVE 拒绝不应产生任何副作用，连备份目录都不该建。
+  //   3. 在 dry-run 之前 —— 预演时也要报告「这个会话现在不能写」，
+  //      否则用户看到的 dry-run 结果是"一切正常"，实际执行却失败。
+  //
+  // 为什么这条比备份优先：备份保护的是「写坏了能恢复」，LIVE 检测保护的是
+  // 「根本不要写坏」。写入活跃会话会让 DSH 内存与磁盘的 next-seq 分叉，
+  // 之后 DSH 自己的写入会被拒或产生 seq 冲突 —— 那是插件不该造成的伤害。
+  let liveness = { live: false, checked: false, reason: '未检测' }
+  if (options.skipLiveCheck !== true) {
+    liveness = await isSessionLive(sessionDir, { execFile: options.lockProbeRunner })
+    if (liveness.live && dryRun !== true) {
+      throw new SyncError(
+        ERROR_CODES.BUSY,
+        `会话 ${sessionId} 正在使用中，已跳过写入以免破坏 DSH 的内存状态。`,
+        {
+          hint: '请先在 DSH 里结束或关闭该会话，再重新同步。',
+          detail: { method: liveness.method, reason: liveness.reason },
+        }
+      )
+    }
+    // checked=false 表示系统里没有 lsof/fuser，我们**没查成**。
+    // 这种情况放行但记录，而不是假装「不 live」（见 isSessionLive 注释）。
+    if (liveness.checked === false) {
+      options.log?.warn?.('session.live-check-unavailable', {
+        sessionId,
+        reason: liveness.reason,
+      })
+    }
+  }
+
+  // ── dry-run：在**编码之前**返回 ──
+  //
+  // dry-run 的承诺是「不产生副作用、不需要真正写入的能力」。如果先编码再判断
+  // dryRun，那么在没有 zstd 压缩能力的环境（Node < 22.15）里跑预演会直接抛错，
+  // 而预演恰恰是最该在这种环境下可用的 —— 先看看会发生什么，再决定要不要装。
+  // 同理，任何编码期错误（数据损坏等）也不该让 dry-run 无法预演。
+  //
+  // 代价：dry-run 拿不到 contentHash（那需要真实编码）。这不是损失 ——
+  // 调用方真正关心的是「会写到哪、会不会覆盖、要不要备份」，
+  // 这些都不需要编码就能算准。
+  if (dryRun) {
+    let wouldBackup = null
+    if (existed) {
+      wouldBackup = join(resolve(backupDir), `${sessionId}.<timestamp>`)
+    }
+    return {
+      written: [],
+      skipped: [],
+      backupPath: wouldBackup,
+      wouldWrite: logFile,
+      wouldOverwrite: existed,
+      sessionId,
+      // dry-run 不编码，所以没有内容指纹；用逻辑指纹表达「内容会是什么」
+      contentHash: null,
+      logicalFingerprint: previewLogicalFingerprint(header, events),
+      eventCount: events.length,
+      // 预演时把「这个会话现在能不能写」也报出来 —— 这正是 dry-run 的价值
+      live: liveness.live,
+      liveChecked: liveness.checked,
+      liveReason: liveness.reason ?? null,
+      dryRun: true,
+    }
+  }
+
+  const bytes = encodeSessionLog(header, events, { cwdOverride, frameEncoder: options.frameEncoder })
+  const contentHash = createHash('sha256').update(bytes).digest('hex')
+
+  // ── 快照：已存在就必须先备份，且验证备份可读 ──
+  let backupPath = null
+  if (existed) {
+    backupPath = await snapshotSessionDir(sessionDir, backupDir, sessionId)
+  }
+
+  // ── 写临时文件 → 校验 → 原子重命名 ──
+  await mkdir(sessionDir, { recursive: true })
+  const tmpFile = join(sessionDir, `.session-${process.pid}-${Date.now()}.tmp`)
+  try {
+    await writeFile(tmpFile, bytes)
+
+    // 校验：**直接解刚写的临时文件**，不是读会话目录。
+    //
+    // 这里曾经写成读 sessionDir 是个真 bug：覆盖已有会话时，目录里躺着的
+    // 是**旧**日志，于是校验通过的是旧内容、新内容从未被验证就被 rename
+    // 顶上去了。校验的对象必须是我们写出的那串字节本身。
+    const tmpRaw = await readFile(tmpFile)
+    const { plaintext: tmpPlain } = decodeLogBuffer(tmpRaw, options)
+    const readBack = parseSessionLog(tmpPlain)
+    if (readBack.header.id !== sessionId) {
+      throw new SyncError(
+        ERROR_CODES.CORRUPT_SESSION,
+        `写入校验失败：临时文件里的会话 id 是 ${readBack.header.id}，期望 ${sessionId}。`
+      )
+    }
+    if (readBack.nextSeq !== events.length) {
+      throw new SyncError(
+        ERROR_CODES.CORRUPT_SESSION,
+        `写入校验失败：期望 ${events.length} 个事件，读回 ${readBack.nextSeq} 个。`
+      )
+    }
+
+    await rename(tmpFile, logFile)
+  } finally {
+    // 无论成败都不要留下临时文件
+    await rm(tmpFile, { force: true })
+  }
+
+  // ── 写入后回读验证 ──
+  const verified = await readSessionDir(sessionDir, { frameDecoder: options.frameDecoder })
+  if (verified.id !== sessionId) {
+    throw new SyncError(
+      ERROR_CODES.CORRUPT_SESSION,
+      `写入后校验失败：读回的会话 id 是 ${verified.id}，期望 ${sessionId}。`
+    )
+  }
+
+  return {
+    written: [logFile],
+    skipped: [],
+    backupPath,
+    sessionId,
+    contentHash,
+    dryRun: false,
+  }
+}
+
+/**
+ * 把整个会话目录复制到备份区，并**回读验证**备份真的可读。
+ *
+ * 「命令返回 0」不等于「备份可用」—— 磁盘满、权限、部分写入都可能让
+ * 一个看起来成功的复制其实是坏的。所以这里逐文件读一遍并比对大小。
+ *
+ * @param {string} sessionDir 源会话目录
+ * @param {string} backupDir 备份根目录
+ * @param {string} sessionId 会话 id（用于命名备份子目录）
+ * @returns {Promise<string>} 备份目录路径
+ * @throws {SyncError} 备份失败（调用方必须中止写入）
+ */
+export async function snapshotSessionDir(sessionDir, backupDir, sessionId) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const safeId = assertSafeSessionId(sessionId, '备份 sessionId')
+  const targetRoot = join(resolve(backupDir), `${safeId}.${stamp}`)
+  assertInside(resolve(backupDir), targetRoot)
+
+  try {
+    await mkdir(targetRoot, { recursive: true })
+
+    const entries = await readdir(resolve(sessionDir), { withFileTypes: true })
+    const copied = []
+    for (const entry of entries) {
+      if (!entry.isFile()) continue
+      const source = join(resolve(sessionDir), entry.name)
+      const destination = join(targetRoot, entry.name)
+      const bytes = await readFile(source)
+      await writeFile(destination, bytes)
+      // 回读验证：备份必须能原样读回同样字节
+      const back = await readFile(destination)
+      if (Buffer.compare(back, bytes) !== 0 || back.length !== bytes.length) {
+        throw new Error(`备份校验失败：${entry.name} 读回内容不一致`)
+      }
+      copied.push(entry.name)
+    }
+
+    if (copied.length === 0) {
+      throw new Error('源会话目录里没有可备份的文件')
+    }
+
+    return targetRoot
+  } catch (cause) {
+    // 备份失败必须中止——绝不「备份失败但继续写」
+    throw new SyncError(
+      ERROR_CODES.BACKUP_FAILED,
+      `无法备份会话 ${sessionId}，已中止写入以保护本机数据。`,
+      {
+        hint: '请检查磁盘空间与目录权限后重试。',
+        cause,
+        detail: { sessionDir, backupDir },
+      }
+    )
+  }
+}
+
+/**
+ * dry-run 用的**预览指纹**：不编码、不压缩，只对逻辑内容做稳定摘要。
+ *
+ * 刻意与 `conflict.js` 的 `logicalFingerprint` 用同一套思路（排除 cwd、
+ * 键序无关），但**不 import 它** —— 那会造成 session-store → conflict 的
+ * 循环依赖，而且这两个概念将来可能独立演进（一个是预览、一个参与判重）。
+ * 需要在判重时一律用 `conflict.js` 的实现。
+ *
+ * @param {object} header
+ * @param {object[]} events
+ * @returns {string}
+ */
+function previewLogicalFingerprint(header, events) {
+  const { cwd, ...stableHeader } = header ?? {}
+  const normalized = events.map((event) => ({
+    type: event?.type ?? null,
+    seq: event?.seq ?? null,
+    data: event?.data ?? null,
+  }))
+  return createHash('sha256')
+    .update(JSON.stringify({ header: stableHeader, events: normalized }))
+    .digest('hex')
+}
+
+/**
+ * 把便捷形态的调用参数展开成标准的 `{sessionId, header, events}` 载荷。
+ *
+ * 生成的是**合成会话**：`rounds` 轮，每轮一对 user/assistant 事件，seq 连续。
+ * 只用于测试与工具脚本快速造数，不参与产品链路。
+ *
+ * @param {object} input
+ * @returns {object}
+ */
+function materializeConveniencePayload(input) {
+  const sessionId = input.sessionId
+  const cwd = input.cwd
+  const rounds = Number.isSafeInteger(input.rounds) && input.rounds > 0 ? input.rounds : 1
+  const events = []
+  for (let r = 0; r < rounds; r++) {
+    events.push({
+      type: 'user/message',
+      seq: events.length,
+      time: 1_700_000_000_000 + events.length * 1000,
+      data: { content: [{ type: 'text', text: `synthetic user round ${r}` }] },
+    })
+    events.push({
+      type: 'assistant/message',
+      seq: events.length,
+      time: 1_700_000_000_000 + events.length * 1000,
+      data: { text: `synthetic assistant round ${r}` },
+    })
+  }
+  return {
+    sessionId,
+    dshHome: input.dshHome,
+    lockProbeRunner: input.lockProbeRunner,
+    dryRun: input.dryRun,
+    skipLiveCheck: input.skipLiveCheck,
+    header: {
+      type: 'session',
+      version: 4,
+      id: sessionId,
+      createdAt: 1_700_000_000_000,
+      cwd,
+      isSeeded: false,
+      delegationDepth: 0,
+      agentPreset: 'cordis',
+    },
+    events,
+  }
+}
+
+/** 路径是否存在（不区分文件/目录）。 */
+async function pathExists(path) {
+  try {
+    await stat(path)
+    return true
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return false
+    throw error
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// 引擎接口（deps.js 期望的 SessionSource）
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 构造 `engine.js` 期望的 `SessionSource`，形状：
+ * `{ list, read, write }`。
+ *
+ * 这一层是**适配器**：把本模块那些细粒度的函数，映射成引擎要的三个动作。
+ * 保持适配器很薄，是为了让引擎不直接依赖本模块的内部结构。
+ *
+ * @param {{store?: object, paths?: object, log?: object}} [context]
+ * @returns {{list: Function, read: Function, write: Function}}
+ */
+export function createSessionSource(context = {}) {
+  const log = context.log ?? { info() {}, warn() {}, error() {} }
+  const resolvedPaths = context.paths ?? null
+
+  const rootOf = (options) => {
+    if (typeof options?.sessionsRoot === 'string') return options.sessionsRoot
+    const dshHome = resolvedPaths?.dshHome
+    if (typeof dshHome === 'string' && dshHome !== '') return sessionsRoot(dshHome)
+    return sessionsRoot(undefined, { env: options?.env })
+  }
+
+  return {
+    /**
+     * 列出某仓库的会话（只读 header，不解全事件）。
+     *
+     * @param {object} binding 仓库绑定
+     * @param {{sessionsRoot?: string, env?: object, includeArchived?: boolean, frameDecoder?: Function, signal?: AbortSignal}} [options]
+     * @returns {Promise<Array<object>>}
+     */
+    async list(binding, options = {}) {
+      const repoPath = binding?.repoPath
+      if (typeof repoPath !== 'string' || repoPath === '') {
+        throw new SyncError(ERROR_CODES.NOT_CONFIGURED, '仓库绑定缺少本地路径。')
+      }
+      const root = rootOf(options)
+      const sessions = await findSessionsForRepo(repoPath, {
+        root,
+        frameDecoder: options.frameDecoder,
+        signal: options.signal,
+      })
+
+      return sessions.map((record) => ({
+        sessionId: record.id,
+        repoId: binding.repoId ?? null,
+        // 精确事件数要用 read()；list() 只做轻量扫描，给的是帧数派生的上界。
+        // 引擎在真正传输前会 read() 拿到精确值，所以这里不会误导决策。
+        eventCount: record.nextSeq ?? record.estimatedEventCount ?? 0,
+        bytes: record.logBytes ?? 0,
+        updatedAt: record.updatedAt ?? record.header?.createdAt ?? 0,
+        cwd: record.header?.cwd,
+        // 水位线是异构的：物理层给字节，逻辑层给 seq。这里给 seq（权威层），
+        // 字节位置由 push 时的切片现场计算，避免状态文件里存易失效的偏移。
+        // 水位线只在**精确知道 nextSeq** 时才给出（即走完整解析的路径）。
+        // list() 只扫 header，帧数派生的是上界而非真值，拿它当水位线会让
+        // 「已同步到第几条」偏大，从而漏掉事件 —— 那是最危险的失败模式。
+        // 所以宁可返回 undefined（调用方据此走全量 read），也不给一个错的数。
+        watermark: record.nextSeq === undefined ? undefined : String(record.nextSeq),
+        parentSession: record.header?.parentSession ?? null,
+        archived: undefined,
+      }))
+    },
+
+    /**
+     * 读一个会话的完整事件流。
+     *
+     * @param {string} sessionId
+     * @param {{sessionsRoot?: string, env?: object, cwd?: string, sessionDir?: string, frameDecoder?: Function, signal?: AbortSignal}} [options]
+     * @returns {Promise<object>} SessionPayload 形状
+     */
+    async read(sessionId, options = {}) {
+      const safeId = assertSafeSessionId(sessionId, 'sessionId')
+      const root = rootOf(options)
+
+      let dir = options.sessionDir
+      if (typeof dir !== 'string' || dir === '') {
+        // 没有给目录就必须有 cwd —— 否则无法定位（目录名不可反解）
+        if (typeof options.cwd !== 'string' || options.cwd === '') {
+          throw new SyncError(
+            ERROR_CODES.BAD_REQUEST,
+            `读取会话 ${safeId} 需要 cwd 或 sessionDir 才能定位文件。`,
+            { hint: 'projectKey 是 lossy 编码，无法从目录名反解出 cwd。' }
+          )
+        }
+        dir = join(resolve(root), projectKey(options.cwd), encodeSegment(safeId))
+      }
+
+      const record = await readSessionDir(dir, {
+        frameDecoder: options.frameDecoder,
+        signal: options.signal,
+      })
+      if (record.id !== safeId) {
+        throw new SyncError(
+          ERROR_CODES.CORRUPT_SESSION,
+          `磁盘上的会话 id（${record.id}）与请求的 ${safeId} 不一致。`
+        )
+      }
+
+      return {
+        version: 1,
+        sessionId: record.id,
+        repoKey: options.repoKey ?? null,
+        eventCount: record.nextSeq,
+        watermark: String(record.nextSeq),
+        contentHash: record.contentHash,
+        content: undefined,
+        header: record.header,
+        events: record.events,
+        updatedAt: record.header?.createdAt ?? 0,
+      }
+    },
+
+    /**
+     * 写入一个下载下来的会话（带备份与回读验证）。
+     *
+     * @param {object} payload
+     * @param {{backupDir: string, sessionsRoot?: string, env?: object, cwdOverride?: string, dryRun?: boolean}} options
+     * @returns {Promise<{written: string[], skipped: string[], backupPath: string|null}>}
+     */
+    async write(payload, options = {}) {
+      const root = rootOf(options)
+      const result = await writeSession(payload, {
+        sessionsRoot: root,
+        backupDir: options.backupDir,
+        cwdOverride: options.cwdOverride,
+        dryRun: options.dryRun,
+        frameEncoder: options.frameEncoder,
+        frameDecoder: options.frameDecoder,
+      })
+      log.info?.('session.write', {
+        sessionId: result.sessionId,
+        backupPath: result.backupPath,
+        dryRun: result.dryRun,
+      })
+      return result
+    },
+  }
+}
+
 
 export { NO_CWD_DIR }

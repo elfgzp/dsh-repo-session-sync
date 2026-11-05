@@ -102,6 +102,15 @@ export function decodeFrame(frame) {
   if (!Buffer.isBuffer(frame) || frame.length < 8) return null;
   if (!frame.subarray(0, 4).equals(ZSTD_MAGIC)) return null;
 
+  // A structural length check MUST run before the runtime decoder.
+  //
+  // Verified hole: `zstdDecompressSync` happily decodes a raw-block frame whose
+  // trailing bytes are missing. A 40-byte frame truncated to 39 still decodes to
+  // the full original JSON, because the runtime trusts the block header's
+  // declared size rather than checking that those bytes are present. Accepting
+  // that would make a half-written append look like a complete session.
+  if (!isStructurallyComplete(frame)) return null;
+
   const native = getNativeZstd();
   if (native) {
     try {
@@ -111,6 +120,61 @@ export function decodeFrame(frame) {
     }
   }
   return decodeRawBlockFrame(frame);
+}
+
+/**
+ * Walk frame/block headers and confirm every declared byte is actually present.
+ * Returns false for a truncated frame — exactly what a half-written append or a
+ * cut-off transfer looks like.
+ *
+ * Frames using a layout this module does not recognise return true so the runtime
+ * decoder still gets a chance; we must not reject real DSH frames we merely do
+ * not model.
+ *
+ * @param {Buffer} frame
+ * @returns {boolean}
+ */
+function isStructurallyComplete(frame) {
+  try {
+    let offset = 4;
+    const fhd = frame[offset++];
+    const fcsFlag = (fhd >> 6) & 0x3;
+    const singleSegment = (fhd >> 5) & 0x1;
+    const hasChecksum = (fhd >> 2) & 0x1;
+    const dictIdFlag = fhd & 0x3;
+
+    // Unknown layout: defer to the runtime decoder.
+    if (fcsFlag !== 2 || singleSegment !== 1 || dictIdFlag !== 0) return true;
+
+    if (offset + 4 > frame.length) return false;
+    const contentSize = frame.readUInt32LE(offset);
+    offset += 4;
+
+    let produced = 0;
+    for (;;) {
+      if (offset + 3 > frame.length) return false; // block header truncated
+      const value = frame.readUIntLE(offset, 3);
+      offset += 3;
+      const lastBlock = value & 0x1;
+      const blockType = (value >> 1) & 0x3;
+      const blockSize = value >>> 3;
+      if (blockType === 0b11) return false; // reserved value, invalid per RFC 8878
+      const payloadBytes = blockType === 1 ? 1 : blockSize; // RLE payload is always 1 byte
+      if (offset + payloadBytes > frame.length) return false; // payload truncated
+      produced += blockSize;
+      offset += payloadBytes;
+      if (lastBlock) break;
+    }
+
+    if (hasChecksum) {
+      if (offset + 4 > frame.length) return false;
+      offset += 4;
+    }
+
+    return produced === contentSize;
+  } catch {
+    return false;
+  }
 }
 
 /**
