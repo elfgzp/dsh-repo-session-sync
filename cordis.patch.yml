@@ -1,6 +1,63 @@
 # dsh-repo-session-sync — profile bundle patch.
-# Registered by `dsh plugin add dsh-repo-session-sync`; the loader merges this
-# patch layer over the profile root. Keep this file minimal: it only mounts the
-# plugin, all behaviour is configured from the Settings page / config schema.
-- id: repo-session-sync
-  name: dsh-repo-session-sync
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# FORMAT NOTE — keep this shape if you copy it.
+# ─────────────────────────────────────────────────────────────────────────────
+# A bundle patch is a top-level YAML **array of loader patch entries**. A plugin
+# is mounted through an `insert:` list whose rows carry `id` / `name` / `config`:
+#
+#     - insert:
+#         - id: <unique row id>
+#           name: <package name>        # must match package.json "name"
+#           config: { ... }             # validated by the package's Config
+#
+# A bare top-level `- id: … / name: …` is NOT an insert. The loader reads it as
+# an *override* of an existing row with that id; when no such row exists, the
+# plugin silently never mounts — nothing errors, nothing appears. That silent
+# failure is why the `insert:` wrapper matters.
+#
+# Rows merge, in order, on top of every bundle layer listed in the profile's
+# `package.json` under `dsh.profile.bundles`. This file is the user's own
+# override layer, so it wins over shipped defaults.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- insert:
+    - id: repo-session-sync
+      name: 'dsh-repo-session-sync'
+      # Every field below is optional: the package's `Config` schema supplies the
+      # same defaults, and an empty `config:` block is valid. They are written out
+      # so the deployment knobs are discoverable without reading the source.
+      config:
+        # Where bindings, sync state, transport mirrors and pre-write backups
+        # live. Empty means `$DSH_HOME/repo-session-sync`; the plugin resolves
+        # that from the Host's profile service rather than a hardcoded path.
+        stateDir: ''
+        # git executable. Empty means whatever `git` resolves to on PATH.
+        gitPath: ''
+        # Default sync direction for a newly bound repository.
+        # up | down | both
+        defaultDirection: both
+        # Default transport channel.
+        # git-branch   an orphan branch inside the project's own repository
+        # git-repo     a separate private repository for session bundles
+        # rsync        rsync over SSH
+        # dsh-remote   reuse a dsh-remote machine entry
+        defaultTransport: git-branch
+        # Ref that carries the session bundle for the git-branch channel.
+        syncBranch: refs/heads/dsh-sessions
+        # Automatic upload. Off by default: auto-sync only ever uploads, and only
+        # for bindings the user marked `autoSync` in the settings page. It never
+        # downloads on its own — that would risk replacing local session logs
+        # while nobody is watching.
+        autoSync: false
+        # Timer interval in ms; 0 disables the timer entirely.
+        autoSyncIntervalMs: 0
+        # Hard caps. A payload that exceeds one is refused with a message naming
+        # the offending item, never silently truncated.
+        maxSessionBytes: 8388608
+        maxBundleBytes: 67108864
+        # How many pre-download backups to keep. Downloads always back up first,
+        # and backups are never pruned down to zero.
+        keepBackups: 10
+        # Contribute a short capability section to the model's system prompt.
+        useSystemPrompt: true
