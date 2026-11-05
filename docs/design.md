@@ -169,6 +169,40 @@ repoKey = normalizeRemoteUrl(remoteOriginUrl)
 > **ADR-1**：绑定键 = 归一化 remote URL。**分支不进键**，只作为 manifest 里的
 > 提示字段（`branch`），用于展示与"锚点过期"判断，不参与身份。
 
+#### ⚠️ 实现现状与 ADR-1 相悖（必须修）
+
+`src/repo-binding.js` 的 `repoKeyOf()` 当前实现是：
+
+```js
+return `${remote.canonical}\u0000${branch}`     // ← 含分支，违反 ADR-1
+```
+
+而它的 JSDoc 也这么写着。**代码注释和设计文档互相矛盾时，实现者会照注释写**，
+所以这条必须在改代码的同时把注释一起改掉，否则下次还会有人照抄。
+
+**为什么这件事比我最初说的更严重**——三条独立证据：
+
+1. **会话 header 里没有 branch 字段**（实测 219 个真实会话，字段全集只有
+   `agentPreset / createdAt / cwd / delegationDepth / id / isSeeded /
+   origin / parentSession / type / version`）。用分支做键，等于**给一个不存在于
+   数据里的维度建索引**。后果不是"跨分支混在一起"，而是**身份漂移**：
+
+   | 时刻 | 当前分支 | 同一会话文件该算哪个绑定 |
+   |---|---|---|
+   | T1 建会话 | `main` | binding(main) |
+   | T2 切分支继续聊 | `feature-x` | binding(feature-x)？**但磁盘上还是同一个文件** |
+
+2. **发现层与绑定层口径不一致**：会话发现按 `header.cwd` 匹配（不看分支），
+   而绑定若按 remote+branch 分键 → 同一批会话被拆到两个 binding，
+   出现"会话在发现集合里、却找不到对应 binding"的自相矛盾状态。
+
+3. **与本文 §3.4 直接冲突**：§3.4 规定 **worktree 共享同一个 `repoKey`**，
+   而 worktree 的定义就是"同一仓库、不同分支"。键里带分支会直接推翻 §3.4。
+
+> **一句话**：**分支属于展示维度，不属于身份维度。**
+> 用户切到 `feature-x` 时看到之前在 `main` 上聊的会话，这是**正确行为**，不是串味。
+> 真要区分，在展示层用 manifest 里的 `branch` 提示，而不是在身份层分键。
+
 ### 3.3 remote URL 归一化
 
 实测多种写法归一化结果一致（脚本见附录 A1）：
