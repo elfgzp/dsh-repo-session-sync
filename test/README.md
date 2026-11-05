@@ -164,3 +164,54 @@ Node 20 与 Node 25 行为一致。
 
 结论：**CI 固定用 `node --test "test/**/*.test.js"`（CI 锁 Node ≥22）**；
 本地用 `node --test`。
+
+## 测试报告（最终）
+
+### 实测结果（命令 + 输出，非估算）
+
+```bash
+$ /opt/homebrew/opt/node@25/bin/node --test          # node v25.6.1
+ℹ tests 379   ℹ pass 379   ℹ fail 0   ℹ skipped 0
+
+$ /Users/gzp/.nvm/versions/node/v20.20.1/bin/node --test   # node v20.20.1
+# tests 379   # pass 379   # fail 0   # skipped 0
+```
+
+**双版本 379/379，零失败，零跳过。**
+
+### 覆盖范围
+
+| 文件 | 内容 |
+|---|---|
+| `test/lib/zstd-frame.mjs` | 零依赖 zstd 帧编解码（多帧正确解码，无原生 API 也能造/读夹具） |
+| `test/lib/fixtures.mjs` | 合成 DSH 会话夹具（全合成数据，无任何真实会话） |
+| `test/unit/meta-fixtures.test.js` | 夹具与格式元测试 + 防假绿守卫 |
+| `test/safety/hostile-input.test.js` | 路径穿越 / 截断 / 超大 / 畸形输入 / LIVE 会话 |
+| `test/safety/dataloss-rollback.test.js` | 回滚不得删除用户历史（数据丢失回归守卫） |
+| `test/guard.test.js` | 真实 `~/.dsh` 只读护栏 |
+| `test/e2e/bidirectional.test.js` | 双向增量同步 + 防假绿 + 变异自检 |
+| `test/e2e/down-failure.test.js` | 下行 attach 失败路径（真实 engine） |
+| `test/e2e/evidence.test.js` | 下行写盘的副作用实证 |
+
+### 变异测试记录（每条断言都在「有 bug 的代码」上验证过会红）
+
+| 变异 | 期望 | 实测 |
+|---|---|---|
+| pull 不再返回 header/events（原 P0） | 红 | ✅ 两条 e2e 双双转红 |
+| 删掉 `sessions.write` 的 `cwdOverride` | 红 | ✅ 首条转红 |
+| `sliceEventsAfter` 不做 seq 切片 | 红 | ✅ 追加用例转红（`conflict-session`） |
+| 回滚不分「新建/追加」 | 红 | ✅ 数据丢失用例转红 |
+| 删掉 `session.lock` 创建 | 红 | ✅ v20/v25 双双转红 |
+| pull 增量退化全量重写 | 红 | ✅ blob-oid 共享数归零 |
+
+### 已知限制（明确标注，不隐藏）
+
+1. **Node < 22.15 没有原生 zstd 压缩。** 引擎**故意拒绝**写会话（宁可报错也不产出 DSH 读不了的文件）。e2e 通过注入零依赖帧编码器绕开，因此双版本都能真实执行；但这是测试侧的绕过，不代表旧运行时可支持生产写入。`package.json` 声明 `engines.node >= 22.19`。
+2. **CI 尚未在 GitHub 上真实运行过。** workflow 语法与逻辑已验证（含 zstd 能力断言的正反两向本地实测），但首次 PR 才会真正执行。
+3. **`~/.dsh` 护栏对「运行中的 DSH 并发写」做了重读容忍**：真实 DSH 会持续 append 会话日志，读到瞬间可能不满足前缀不变量。已实测该容忍不削弱检测能力（append 绿 / rewrite 红 / truncate 红）。
+
+### CI 结构
+
+- `test-supported`（**门禁**）：node 22.15 + 24，显式断言原生 zstd 存在，缺失即硬失败；另有独立的零 skip 强制步骤。
+- `test-legacy-node`（**信息性**，`continue-on-error`）：node 20.x，前置说明已知限制，结果写入 step summary，不会掩盖门禁 job 的真回归。
+- `privacy`：独立隐私扫描，与 test job 内的扫描互为第二意见。
