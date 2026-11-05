@@ -3,31 +3,32 @@
  *
  * The whole product exists to move sessions between machines. If any code path
  * writes to the user's real `~/.dsh` unexpectedly, the user loses conversation
- * history. This suite snapshots the real DSH home before running anything and
- * asserts afterwards that:
+ * history.
  *
- *   - no file was added, removed, or renamed,
- *   - no file's content hash changed,
- *   - no file's mtime changed,
+ * Note this protects against a *specific* failure mode. It cannot assert
+ * "nothing changed", because on a live install the running DSH appends to its
+ * own logs continuously. Instead it relies on the storage format's own
+ * invariant:
  *
- * It also double-checks the *other* suites' own behaviour: they must all run
- * inside temporary directories, so this snapshot should always come back clean.
+ *   session logs are APPEND-ONLY  ->  the old bytes must remain a prefix of the
+ *   new bytes, and the log must never shrink
  *
- * Deliberately read-only: it hashes and stats, never opens a session for write.
+ * A legitimate live write only appends, so this stays green under normal
+ * traffic; a sync bug that rewrites, truncates or replaces a log breaks it.
+ * It also asserts that no file disappears and that no fixture-shaped path ever
+ * appears under the real home (which catches creation of new files).
+ *
+ * Deliberately read-only: it stats and reads, never opens a session for write.
  */
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 /** Largest session log whose full prefix the guard will hold in memory. */
 const MAX_GUARD_BYTES = 64 * 1024 * 1024;
-
-/** Milliseconds to observe the real home for live (non-test) writes. */
-const CONTROL_WINDOW_MS = Number(process.env.DSH_GUARD_CONTROL_MS ?? 3000);
 
 /**
  * Path fragments that only our fixtures ever produce. If one shows up under the
@@ -88,70 +89,6 @@ function captureSessionState(root) {
   };
   walk(root, '');
   return { allFiles, sessionLogs };
-}
-
-/**
- * Snapshot a directory tree: relative path -> {size, mtimeMs, hash}.
- * `hash` is only computed for files under a size cap, so the guard stays fast
- * on machines with large session logs; everything else still gets size+mtime.
- */
-function snapshotTree(root, { maxHashBytes = 4 * 1024 * 1024 } = {}) {
-  const entries = new Map();
-  if (!existsSync(root)) return entries;
-
-  const walk = (dir, prefix) => {
-    let items;
-    try {
-      items = readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return; // unreadable directory: skip rather than fail the guard
-    }
-    for (const item of items) {
-      const full = join(dir, item.name);
-      const rel = prefix ? `${prefix}/${item.name}` : item.name;
-      if (item.isDirectory()) {
-        walk(full, rel);
-        continue;
-      }
-      if (!item.isFile()) continue;
-      try {
-        const st = statSync(full);
-        const record = { size: st.size, mtimeMs: st.mtimeMs, hash: null };
-        if (st.size <= maxHashBytes) {
-          record.hash = createHash('sha256').update(readFileSync(full)).digest('hex').slice(0, 32);
-        }
-        entries.set(rel, record);
-      } catch {
-        // A file that vanished mid-walk (DSH appending) is expected; ignore.
-      }
-    }
-  };
-  walk(root, '');
-  return entries;
-}
-
-/** Compare two snapshots; returns a human-readable list of differences. */
-function diffSnapshots(before, after) {
-  const problems = [];
-
-  for (const [rel, record] of before) {
-    const now = after.get(rel);
-    if (!now) {
-      problems.push(`removed: ${rel}`);
-      continue;
-    }
-    if (now.size !== record.size) {
-      problems.push(`size changed: ${rel} (${record.size} -> ${now.size})`);
-    } else if (record.hash !== null && now.hash !== null && now.hash !== record.hash) {
-      problems.push(`hash changed: ${rel}`);
-    }
-    // mtime is reported separately: a running DSH session legitimately appends.
-  }
-
-  for (const rel of after.keys()) {
-    if (!before.has(rel)) problems.push(`added: ${rel}`);
-  }
-  return problems;
 }
 
 test('guard: the real user DSH home is untouched by the test run', async (t) => {

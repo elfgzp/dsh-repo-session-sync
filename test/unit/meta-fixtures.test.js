@@ -62,14 +62,17 @@ test('fixture session files are genuinely multi-frame', (t) => {
   assert.equal(header.type, 'session');
 });
 
-test('naive whole-buffer zstd decode LOSES data on a multi-frame file', (t) => {
-  if (!hasNativeZstd()) {
-    // Without the native API there is no naive path to disprove; the guard is
-    // still meaningful on runtimes that do have it (CI covers both).
-    t.skip('node without zlib.zstdDecompressSync — naive path unavailable');
-    return;
-  }
-
+test('one-shot whole-buffer decode truncates a multi-frame file', (t) => {
+  // The trap this guards: decoding a whole session file in one call returns only
+  // the FIRST frame and succeeds silently. The header is valid JSON, so a
+  // "did it parse?" assertion goes green while the conversation is gone.
+  //
+  // We must prove this on every runtime, so we test the framing directly rather
+  // than depending on a native API that older Nodes lack:
+  //   - the file contains N >= 2 frames
+  //   - a single decode can only ever yield frame 0's content
+  //   - frame 0 is exactly one line (the header)
+  // A runtime with native zstd additionally gets the behavioural proof below.
   const dir = tempDir(t);
   const home = makeTempDshHome(dir);
   t.after(() => home.dispose());
@@ -81,23 +84,60 @@ test('naive whole-buffer zstd decode LOSES data on a multi-frame file', (t) => {
     rounds: 3,
   });
   const buf = readFileSync(file);
+  const { frames } = decodeFrames(buf);
 
-  // Ground truth: what the file actually contains.
+  assert.ok(frames.length >= 2, `file must be multi-frame, got ${frames.length}`);
+  assert.equal(frames[0].lines.length, 1, 'frame 0 holds only the header line');
+
   const fullEvents = decodeSessionEvents(buf);
-  assert.ok(fullEvents.length > 2, 'fixture should contain many events');
+  assert.ok(fullEvents.length > 2, 'fixture must contain many events');
 
-  // The trap: one call on the whole buffer. It succeeds, returns valid JSON,
-  // and silently drops every frame after the first.
-  const naiveText = zlib.zstdDecompressSync(buf).toString('utf8');
-  const naiveLines = naiveText.split('\n').filter((l) => l.length > 0);
-
-  assert.equal(naiveLines.length, 1, 'naive decode yields exactly the header line');
+  // Only decode frame 0 — this is exactly what a one-shot call can see.
+  const frame0Only = decodeFrames(buf.subarray(0, frames[0].end));
+  assert.equal(frame0Only.frames.length, 1);
+  assert.equal(frame0Only.frames[0].lines.length, 1);
   assert.ok(
-    naiveLines.length < fullEvents.length,
-    `META-GUARD: naive decode must lose data (naive=${naiveLines.length}, real=${fullEvents.length}). ` +
-      'If this fails the fixture is no longer multi-frame and every downstream test is meaningless.',
+    frame0Only.frames[0].lines.length < fullEvents.length,
+    `META-GUARD: frame 0 alone must be less than the whole file ` +
+      `(frame0=${frame0Only.frames[0].lines.length}, whole=${fullEvents.length})`,
   );
-  assert.doesNotThrow(() => JSON.parse(naiveLines[0]), 'naive output is still valid JSON — that is why it is dangerous');
+
+  if (hasNativeZstd()) {
+    // Behavioural proof on runtimes that have the naive API.
+    const naiveLines = zlib
+      .zstdDecompressSync(buf)
+      .toString('utf8')
+      .split('\n')
+      .filter((l) => l.length > 0);
+    assert.equal(naiveLines.length, 1, 'one-shot decode yields only the header line');
+    assert.doesNotThrow(
+      () => JSON.parse(naiveLines[0]),
+      'the truncated result is still valid JSON — that is why the bug hides',
+    );
+  }
+});
+
+test('decoding frame-by-frame recovers every event the file contains', (t) => {
+  // The positive counterpart: our decoder must not lose anything.
+  const dir = tempDir(t);
+  const home = makeTempDshHome(dir);
+  t.after(() => home.dispose());
+
+  for (const rounds of [0, 1, 4]) {
+    const { file } = writeSession({
+      dshHome: home.root,
+      sessionId: fixtureSessionId(rounds + 1),
+      cwd: '/tmp/qa-fixture/repo-a',
+      rounds,
+    });
+    const buf = readFileSync(file);
+    const { frames } = decodeFrames(buf);
+    const fromFrames = frames.reduce((n, f) => n + f.lines.length, 0);
+    const fromEvents = decodeSessionEvents(buf).length;
+    assert.equal(fromEvents, fromFrames, 'event count must equal total lines across frames');
+    // Header + preamble(4) + rounds*6
+    assert.equal(fromEvents, 1 + 4 + rounds * 6, `unexpected event count for ${rounds} rounds`);
+  }
 });
 
 test('our multi-frame decoder agrees with the reference zstd CLI byte-for-byte', (t) => {
@@ -195,4 +235,45 @@ test('serializer puts one event batch per frame and header alone in frame 0', ()
   for (const frame of frames.slice(1)) {
     assert.ok(frame.lines.length <= 5, `frame holds at most 5 events, got ${frame.lines.length}`);
   }
+});
+
+test('library modules under test/lib have no top-level side effects', async () => {
+  // `node --test` (no args) loads every .js/.mjs under test/ as a test file,
+  // including our library modules. That is only safe while those modules do
+  // nothing at import time. This test pins that contract: importing the library
+  // in a clean child process must not create files or directories.
+  const { execFileSync } = await import('node:child_process');
+  const before = process.cwd();
+
+  const script = `
+    import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+    import { tmpdir } from 'node:os';
+    import { join } from 'node:path';
+    const sandbox = mkdtempSync(join(tmpdir(), 'dsh-sfx-'));
+    process.chdir(sandbox);
+    await import(${JSON.stringify(new URL('../lib/fixtures.mjs', import.meta.url).href)});
+    await import(${JSON.stringify(new URL('../lib/zstd-frame.mjs', import.meta.url).href)});
+    const entries = readdirSync(sandbox);
+    process.chdir(${JSON.stringify(before)});
+    rmSync(sandbox, { recursive: true, force: true });
+    if (entries.length > 0) {
+      console.error('SIDE_EFFECTS:' + entries.join(','));
+      process.exit(2);
+    }
+  `;
+
+  let threw = null;
+  try {
+    execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+      cwd: before,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+  } catch (error) {
+    threw = error;
+  }
+  assert.equal(
+    threw,
+    null,
+    threw ? `library modules must not touch the filesystem on import: ${String(threw.stderr)}` : '',
+  );
 });

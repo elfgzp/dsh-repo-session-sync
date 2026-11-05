@@ -139,3 +139,28 @@ projectKey = '--' + cwd.replace(/^\//, '').replaceAll('/', '-') + '--'
 `encodeFrame()` 输出 **raw block** 帧（RFC 8878 §3.1.1.3），零依赖、合法，可被任何
 合规解码器读取。已验证：真实 `zstd` CLI `-t` 通过、`-d` 结果与原字节 `cmp` 完全一致、
 多帧文件 `zstd -l` 正确报帧数。
+
+## 约定：测试文件与库文件的边界
+
+`npm test` 在无参数形式下会把 `test/` 下**所有** `.js`/`.mjs` 当测试文件加载
+（实测会把 `test/lib/fixtures.mjs`、`test/lib/zstd-frame.mjs` 也列进 subtest）。
+Node 20 与 Node 25 行为一致。
+
+因此约定：
+
+- **`test/lib/**`、`test/fixtures/**` 顶层必须零副作用** —— 只允许 import / export /
+  函数与常量定义，**不得**在模块顶层建目录、写文件、读真实 home、起进程。
+  否则 `npm test` 会连带执行它们。
+- 测试文件命名一律 `*.test.js`，库文件一律 `.mjs`（或非 `.test.js`），便于
+  `node --test "test/**/*.test.js"` 精确筛选。
+
+跑法（跨版本差异，实测）：
+
+| 命令 | Node 20 | Node 25 |
+|---|---|---|
+| `node --test` | ✅ 扫全部（含库文件） | ✅ 扫全部（含库文件） |
+| `node --test "test/**/*.test.js"` | ❌ 不展开 glob | ✅ 精确只跑测试 |
+| `node --test test/unit` | ✅ 目录参数可用 | ✅ |
+
+结论：**CI 固定用 `node --test "test/**/*.test.js"`（CI 锁 Node ≥22）**；
+本地用 `node --test`。
