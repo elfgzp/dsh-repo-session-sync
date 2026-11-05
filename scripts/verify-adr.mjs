@@ -244,6 +244,39 @@ async function main() {
     )
   }
 
+  // ── ADR-13b：系统性错误分类常量不得被架空 ───────────────────────────
+  //
+  // 这条检查针对一个真实发生过两次的事故形态：`SYSTEMIC_DOWN_FAILURES`
+  // 定义在文件顶部、使用点在近千行之后，于是「常量还在、用它的分支没了」
+  // 这种半成品状态可以同时通过类型检查、单元测试和一次提交 —— 因为没人
+  // 会同时看到那两处。
+  //
+  // 后果不是风格问题：`bad-request` 被降级成「跳过这个会话」，`down` 继续
+  // 跑完并返回 ok:true，用户看到同步成功而磁盘是空的。
+  //
+  // 单靠一条 grep 不够 —— 只断言「`has(` 出现过」会在常量被彻底删掉时也通过
+  // （那时它当然不会再出现）。所以拆成两条：**定义还在**、**使用点还在**。
+  {
+    const declared = /const\s+SYSTEMIC_DOWN_FAILURES\s*=/.test(engineSrc)
+    const used = /SYSTEMIC_DOWN_FAILURES\.has\(/.test(engineSrc)
+
+    check(
+      'ADR-13b',
+      '系统性错误分类常量仍被定义（ADR-13 的判定依据存在）',
+      declared,
+      declared ? '' : '`const SYSTEMIC_DOWN_FAILURES` 已不存在 —— 分类的依据被删了'
+    )
+    check(
+      'ADR-13b',
+      '分类常量存在真实使用点，未被架空（孤儿常量 = P0 防线失效）',
+      used,
+      used
+        ? ''
+        : '常量已定义但没有 `SYSTEMIC_DOWN_FAILURES.has(...)` 调用点 —— '
+          + '说明分类分支被删了，系统性错误会被降级成 skipped 并报假成功'
+    )
+  }
+
   // ── G2b：writeSession 产出的目录必须含 session.lock ─────────────────
   //
   // 注意：writeSession 需要原生 zstd 压缩能力（Node >= 22.15）。
