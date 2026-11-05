@@ -71,6 +71,13 @@ jobs:
       - name: Run tests
         run: node --test "test/**/*.test.js"
 
+      - name: Verify ADR conformance
+        # Turns "the design says X" into an assertion that fails the build when the
+        # implementation drifts. Several of these checks exist because a decision
+        # was silently undone once (see ADR-13b: a classification constant survived
+        # while the branch using it did not, so systemic failures reported success).
+        run: node scripts/verify-adr.mjs
+
       - name: Enforce zero skipped tests
         # A skipped test verifies nothing while making the report look green.
         # On supported runtimes there is no legitimate reason to skip.

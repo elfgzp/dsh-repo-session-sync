@@ -38,6 +38,16 @@ import { allowsDown, allowsUp } from './repo-binding.js'
  * 这些错误码表示远端载荷本身不可用（形状不对、解码失败、字段缺失），
  * 它不会因为换个会话就变好 —— 把它当成 skipped 会让整次下行报 ok:true，
  * 而用户实际上一个会话都没拿到。
+ *
+ * ## 唯一使用点
+ *
+ * `runDown()` 的 catch 分支（搜索 `SYSTEMIC_DOWN_FAILURES.has(`）。
+ *
+ * **如果 grep 不到那个使用点，说明分类逻辑被删了 —— 那是 P0 回归，不是死代码。**
+ * 这个常量与它的使用点相隔近千行，曾经出现过「常量留下、分支没了」的半成品
+ * 状态被提交，而类型检查、单元测试全都通过。所以有两道防线：
+ *   1. `scripts/verify-adr.mjs` 的 ADR-13b 会断言使用点存在（CI 每次跑）
+ *   2. `test/unit/engine-assembly.test.js` 的 P0 回归会在行为层报红
  */
 const SYSTEMIC_DOWN_FAILURES = new Set([
   ERROR_CODES.BAD_REQUEST,
