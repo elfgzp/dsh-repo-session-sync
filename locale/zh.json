@@ -1,0 +1,9 @@
+{
+  "meta": {
+    "title": "仓库会话同步",
+    "description": "把 DSH 会话与 git 仓库绑定，在多机之间同步——代码走 git，对话跟着走。"
+  },
+  "nav.label": "仓库会话同步",
+  "section.title": "仓库会话同步",
+  "section.missingUi": "设置页界面尚未接入（缺少 src/ui/settings-page.js）。宿主侧的路由与配置层已就绪。"
+}

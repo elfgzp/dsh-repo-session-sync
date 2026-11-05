@@ -1,0 +1,9 @@
+{
+  "meta": {
+    "title": "Repository Session Sync",
+    "description": "Bind DSH sessions to git repositories and sync them across machines — code travels by git, conversation follows."
+  },
+  "nav.label": "Repository Session Sync",
+  "section.title": "Repository Session Sync",
+  "section.missingUi": "The settings UI is not wired up yet (src/ui/settings-page.js is missing). Host routes and the config layer are ready."
+}
