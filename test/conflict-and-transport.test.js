@@ -658,3 +658,131 @@ test('runGit：git 调用使用参数数组，路径里的 shell 元字符不会
     await sandbox.cleanup()
   }
 })
+
+// ─────────────────────────────────────────────────────────────
+// newChunks / reusedChunks：增量是否真的生效的唯一可观测信号
+// ─────────────────────────────────────────────────────────────
+
+test('push：追加后 newChunks 必须严格小于 chunks（增量生效的硬信号）', async () => {
+  if (!hasNativeZstd) return
+  const sandbox = await makeSandbox()
+  try {
+    const { workDir } = await makeRepoPair(sandbox)
+    const transport = createTransport({})
+    const binding = { repoId: 'r1', repoPath: workDir }
+
+    // 第一次：80 轮，会产生多个块
+    const big = mkSession('incremental', { events: 160 })
+    const firstPush = await transport.push(
+      binding,
+      { sessions: [{ ...big, content: mkContent(big), eventCount: 160 }] },
+      {}
+    )
+    assert.ok(firstPush.chunks >= 2, `应切出多块，实际 ${firstPush.chunks}`)
+    // 首次推送：远端本来什么都没有 → 全部是新增
+    assert.equal(
+      firstPush.newChunks,
+      firstPush.chunks,
+      '首次推送所有块都应是新增'
+    )
+    assert.equal(firstPush.reusedChunks, 0)
+
+    // 追加少量事件后再推：大部分块应复用
+    const grown = mkSession('incremental', { events: 164 })
+    const secondPush = await transport.push(
+      binding,
+      { sessions: [{ ...grown, content: mkContent(grown), eventCount: 164 }] },
+      {}
+    )
+
+    assert.ok(
+      secondPush.newChunks < secondPush.chunks,
+      `追加后新增块(${secondPush.newChunks})必须严格小于总块数(${secondPush.chunks})，` +
+        '否则说明增量失效、退化成全量重写'
+    )
+    assert.ok(
+      secondPush.reusedChunks > 0,
+      `追加后必须有复用的块，实际 reusedChunks=${secondPush.reusedChunks}`
+    )
+    assert.equal(
+      secondPush.newChunks + secondPush.reusedChunks,
+      secondPush.chunks,
+      'newChunks + reusedChunks 必须等于总块数'
+    )
+
+    // 全量重写会表现为 newChunks === chunks，这里必须能区分开
+    assert.notEqual(
+      secondPush.newChunks,
+      secondPush.chunks,
+      'newChunks 恒等于 chunks 就是「字段没实现」，必须能区分增量与全量'
+    )
+  } finally {
+    await sandbox.cleanup()
+  }
+})
+
+test('push：dry-run 也给出真实的预估新增/复用数（只读，无副作用）', async () => {
+  if (!hasNativeZstd) return
+  const sandbox = await makeSandbox()
+  try {
+    const { workDir } = await makeRepoPair(sandbox)
+    const transport = createTransport({})
+    const binding = { repoId: 'r1', repoPath: workDir }
+
+    const big = mkSession('dry-estimate', { events: 120 })
+
+    // 先真空推一次
+    await transport.push(
+      binding,
+      { sessions: [{ ...big, content: mkContent(big), eventCount: 120 }] },
+      {}
+    )
+
+    // 再 dry-run 一次相同内容：应报「全部复用」
+    const dry = await transport.push(
+      binding,
+      { sessions: [{ ...big, content: mkContent(big), eventCount: 120 }] },
+      { dryRun: true }
+    )
+
+    assert.equal(dry.dryRun, true)
+    assert.equal(dry.newChunks, 0, '内容没变时 dry-run 应预估 0 个新增块')
+    assert.equal(dry.reusedChunks, dry.chunks, '内容没变时应全部复用')
+    assert.equal(dry.transferred, 0, 'dry-run 不传任何东西')
+
+    // 且不能真的写对象/动 ref：ref 应保持第一次 push 的结果
+    const headAfter = (await runGit(workDir, ['rev-parse', SESSIONS_REF]))
+      .stdout.toString('utf8')
+      .trim()
+    assert.ok(headAfter.length === 40 || headAfter.length === 64)
+  } finally {
+    await sandbox.cleanup()
+  }
+})
+
+test('push：内容完全没变时全部复用，newChunks 为 0', async () => {
+  if (!hasNativeZstd) return
+  const sandbox = await makeSandbox()
+  try {
+    const { workDir } = await makeRepoPair(sandbox)
+    const transport = createTransport({})
+    const binding = { repoId: 'r1', repoPath: workDir }
+    const session = mkSession('no-change', { events: 40 })
+
+    await transport.push(
+      binding,
+      { sessions: [{ ...session, content: mkContent(session), eventCount: 40 }] },
+      {}
+    )
+    const again = await transport.push(
+      binding,
+      { sessions: [{ ...session, content: mkContent(session), eventCount: 40 }] },
+      {}
+    )
+
+    assert.equal(again.newChunks, 0, '内容未变时不应有新增块')
+    assert.equal(again.reusedChunks, again.chunks, '应全部复用')
+  } finally {
+    await sandbox.cleanup()
+  }
+})

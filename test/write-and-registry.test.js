@@ -30,7 +30,7 @@ import {
   rollbackNewSessions,
 } from '../src/registry.js'
 import { makeSandbox, fakeSessionId, encodeFrameRawBlock } from './fixtures/synth.js'
-import { decodeFramePureJs, probeZstd, isSessionLive, setLockProbeRunner } from '../src/session-store.js'
+import { decodeFramePureJs, probeZstd, isSessionLive } from '../src/session-store.js'
 
 const hasNativeZstd = probeZstd().available
 const READ = hasNativeZstd ? {} : { frameDecoder: decodeFramePureJs }
@@ -545,28 +545,24 @@ test('isSessionLive：lsof 报告有持有者 → live=true', async () => {
     await mkdir(dir, { recursive: true })
     await writeFile(join(dir, 'session.lock'), '')
 
-    // 注入一个「lsof 说有持有者」的执行器
-    setLockProbeRunner(async (command) => {
-      if (command === 'lsof') {
-        return {
-          available: true,
-          code: 0,
-          stdout: 'COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\ndsh     4242 gzp    8w   REG   1,2      0  123 /tmp/x/session.lock\n',
-          stderr: '',
-        }
-      }
-      return { available: false, code: 127, stdout: '', stderr: '' }
+    // 调用级注入：不走模块级全局开关（那会在并行测试里污染其他文件）
+    const result = await isSessionLive(dir, {
+      execFile: async (command) =>
+        command === 'lsof'
+          ? {
+              available: true,
+              code: 0,
+              stdout:
+                'COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n' +
+                'dsh     4242 gzp    8w   REG   1,2      0  123 /tmp/x/session.lock\n',
+              stderr: '',
+            }
+          : { available: false, code: 127, stdout: '', stderr: '' },
     })
-    // 还原必须在 finally 里
-    try {
-      const result = await isSessionLive(dir)
-      assert.equal(result.live, true)
-      assert.equal(result.checked, true)
-      assert.match(result.reason, /打开|使用中/)
-      assert.match(result.reason, /dsh/, 'reason 应包含持有者命令名，便于用户定位')
-    } finally {
-      setLockProbeRunner(null)
-    }
+    assert.equal(result.live, true)
+    assert.equal(result.checked, true)
+    assert.match(result.reason, /打开|使用中/)
+    assert.match(result.reason, /dsh/, 'reason 应包含持有者命令名，便于用户定位')
   } finally {
     await sandbox.cleanup()
   }
@@ -580,34 +576,29 @@ test('isSessionLive：lsof 只有表头 → 判定不 live', async () => {
     await mkdir(dir, { recursive: true })
     await writeFile(join(dir, 'session.lock'), '')
 
-    setLockProbeRunner(async () => ({
-      available: true,
-      code: 0,
-      stdout:
-        'COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n' +
-        'other   9999 gzp    8w   REG   1,2      0  123 /somewhere/else\n',
-      stderr: '',
-    }))
-    try {
-      // 关键：表头行不能被当成持有者
-      const result = await isSessionLive(dir)
-      assert.equal(result.live, true, '有非表头行即视为被持有')
-    } finally {
-      setLockProbeRunner(null)
-    }
+    // 有非表头行 → 被持有
+    const held = await isSessionLive(dir, {
+      execFile: async () => ({
+        available: true,
+        code: 0,
+        stdout:
+          'COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n' +
+          'other   9999 gzp    8w   REG   1,2      0  123 /somewhere/else\n',
+        stderr: '',
+      }),
+    })
+    assert.equal(held.live, true, '有非表头行即视为被持有')
 
-    setLockProbeRunner(async () => ({
-      available: true,
-      code: 0,
-      stdout: 'COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n',
-      stderr: '',
-    }))
-    try {
-      const result = await isSessionLive(dir)
-      assert.equal(result.live, false, '只有表头时应判定未被持有')
-    } finally {
-      setLockProbeRunner(null)
-    }
+    // 只有表头 → 未被持有（表头行不能被当成持有者）
+    const free = await isSessionLive(dir, {
+      execFile: async () => ({
+        available: true,
+        code: 0,
+        stdout: 'COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n',
+        stderr: '',
+      }),
+    })
+    assert.equal(free.live, false, '只有表头时应判定未被持有')
   } finally {
     await sandbox.cleanup()
   }
@@ -621,24 +612,16 @@ test('isSessionLive：lsof/fuser 都不存在 → checked=false（明确表示�
     await mkdir(dir, { recursive: true })
     await writeFile(join(dir, 'session.lock'), '')
 
-    setLockProbeRunner(async () => ({
-      available: false,
-      code: 127,
-      stdout: '',
-      stderr: '',
-    }))
-    try {
-      const result = await isSessionLive(dir)
-      assert.equal(result.live, false)
-      assert.equal(
-        result.checked,
-        false,
-        '查不成时不能假装「不 live」，必须明确暴露这一事实'
-      )
-      assert.match(String(result.reason), /无法判断/)
-    } finally {
-      setLockProbeRunner(null)
-    }
+    const result = await isSessionLive(dir, {
+      execFile: async () => ({ available: false, code: 127, stdout: '', stderr: '' }),
+    })
+    assert.equal(result.live, false)
+    assert.equal(
+      result.checked,
+      false,
+      '查不成时不能假装「不 live」，必须明确暴露这一事实'
+    )
+    assert.match(String(result.reason), /无法判断/)
   } finally {
     await sandbox.cleanup()
   }
@@ -661,18 +644,8 @@ test('writeSession：LIVE 会话拒绝写入，且不产生任何副作用', asy
     // isSessionLive 会走「无锁文件 → 不可能有活写入者」的短路，测不到目标分支。
     await writeFile(join(dir, 'session.lock'), '')
 
-    // 让检测认为「会话正在被使用」
-    setLockProbeRunner(async (command) =>
-      command === 'lsof'
-        ? {
-            available: true,
-            code: 0,
-            stdout: 'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\ndsh 1 gzp 8w REG 1,2 0 1 x\n',
-            stderr: '',
-          }
-        : { available: false, code: 127, stdout: '', stderr: '' }
-    )
-    try {
+    // 让检测认为「会话正在被使用」—— 直接通过 writeSession 的参数注入
+    {
       const updated = {
         ...payload,
         events: payload.events.concat({ type: 'assistant/message', seq: 3, time: 1, data: {} }),
@@ -696,8 +669,6 @@ test('writeSession：LIVE 会话拒绝写入，且不产生任何副作用', asy
         (err) => err.code === 'busy',
         'LIVE 会话必须被拒绝'
       )
-    } finally {
-      setLockProbeRunner(null)
     }
 
     const after = await readFile(join(dir, currentLogFilename()))

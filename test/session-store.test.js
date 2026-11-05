@@ -511,6 +511,14 @@ test('classifyIncoming：相等→append、小于→up-to-date、大于→gap', 
   assert.equal(classifyIncoming({ nextSeq: 5 }, { fromSeq: 2, toSeqExclusive: 3 }).action, 'up-to-date')
   assert.equal(classifyIncoming({ nextSeq: 5 }, { fromSeq: 7, toSeqExclusive: 9 }).action, 'gap')
   assert.equal(classifyIncoming({ nextSeq: 5 }, { fromSeq: 8, toSeqExclusive: 7 }).action, 'gap')
+
+  // 远端落后于本机：这是正常情形（本机更全），不能报成 gap。
+  // 报成 gap 会让 engine 走冲突路径，产生「假冲突」。
+  assert.equal(
+    classifyIncoming({ nextSeq: 5 }, { fromSeq: 5, toSeqExclusive: 3 }).action,
+    'up-to-date',
+    '远端比本机少时应为 up-to-date（本机领先），不是 gap'
+  )
 })
 
 test('安全：路径穿越与凭据路径一律拒绝', async (t) => {

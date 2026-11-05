@@ -1290,6 +1290,17 @@ export function classifyIncoming(local, remote) {
     return { action: 'gap', reason: '远端区间不是合法整数' }
   }
   if (toSeqExclusive < fromSeq) {
+    // 区间倒置有两种可能，必须分开：
+    //   - 远端比本机少（fromSeq 就是远端自己的长度）→ 本机领先，无需动作
+    //   - 真的传错了 → gap
+    // 前者是正常情形（远端落后于本机），按 gap 处理会让「本机领先」被误报成
+    // 「包不完整」并走冲突路径，属于假冲突。
+    if (fromSeq <= local.nextSeq) {
+      return {
+        action: 'up-to-date',
+        reason: `远端只有 ${toSeqExclusive} 条事件、本机有 ${local.nextSeq} 条：本机领先，无需追加`,
+      }
+    }
     return { action: 'gap', reason: `远端区间倒置：${fromSeq}..${toSeqExclusive}` }
   }
   if (fromSeq === local.nextSeq) {
@@ -1386,7 +1397,10 @@ export function assertNotCredentialPath(path) {
  * 抢不到会阻塞、侥幸抢到反而会把真的写入者挡住。只观察、不干预。
  *
  * @param {string} sessionDir 会话目录
- * @param {{execFile?: Function, timeoutMs?: number}} [options] 测试注入
+ * @param {{execFile?: Function, timeoutMs?: number}} [options]
+ *   `execFile` 是**调用级**注入，不是模块级全局开关 —— 后者在多文件并行
+ *   测试下会互相污染（本模块曾有一个 `setLockProbeRunner` 全局设置，
+ *   导致无关测试随机失败），这里刻意只走参数。
  * @returns {Promise<{live: boolean, checked: boolean, reason?: string, method?: string}>}
  */
 export async function isSessionLive(sessionDir, options = {}) {
@@ -1398,7 +1412,7 @@ export async function isSessionLive(sessionDir, options = {}) {
     return { live: false, checked: true, method: 'no-lock-file' }
   }
 
-  const runner = options.execFile ?? defaultExecFile
+  const runner = options.execFile ?? defaultExecFileImpl
   const timeoutMs = options.timeoutMs ?? 5_000
 
   // ── 1) lsof ──
@@ -1494,18 +1508,6 @@ function defaultExecFileImpl(command, args, options) {
       }
     )
   })
-}
-
-/** 探测锁时注入口（测试可替换）。 */
-let defaultExecFile = defaultExecFileImpl
-
-/**
- * 替换锁探测用的命令执行器（仅测试使用）。
- *
- * @param {Function} impl
- */
-export function setLockProbeRunner(impl) {
-  defaultExecFile = impl ?? defaultExecFileImpl
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -2015,6 +2017,143 @@ export async function appendToSession(payload, options) {
     nextSeq: verified.nextSeq,
     truncatedTailBytes,
     dryRun: false,
+  }
+}
+
+/**
+ * 从备份还原一个会话目录到备份时的状态。
+ *
+ * ## 为什么需要「还原」而不只是「不删」
+ *
+ * `appendToSession` 成功写入了字节，但后续步骤（比如 workspace registry 登记）
+ * 失败时，磁盘状态会停在「多出 N 条事件」而 DSH 只看到旧的那部分 ——
+ * 数据没丢，但**状态不一致**，用户下次打开会看到一半的对话。
+ *
+ * 对一个**已存在**的会话，正确做法不是删掉它（那会丢掉用户全部历史），
+ * 而是把它还原到本次操作之前的样子。备份就是为此存在的。
+ *
+ * ## 安全边界
+ *
+ *   - 备份目录必须真的存在且**在 backupDir 之内**（防越界写入）
+ *   - 还原前先把「当前状态」另存一份 —— 还原本身也可能出错，
+ *     不能让一次失败的还原把唯一剩下的一致状态也毁掉
+ *   - 还原后回读验证：事件数必须等于备份时的事件数
+ *
+ * @param {object} input
+ * @param {string} input.sessionDir 要还原的会话目录
+ * @param {string} input.backupPath 备份目录（由 writeSession/appendToSession 返回）
+ * @param {string} input.backupDir 备份根目录（用于校验 backupPath 在范围内 + 存还原前快照）
+ * @param {string} input.sessionId 会话 id（日志与校验用）
+ * @param {Function} [input.frameDecoder] 测试注入
+ * @returns {Promise<{restored: boolean, sessionId: string, sessionDir: string,
+ *                    eventsBefore: number|null, eventsAfter: number,
+ *                    safetySnapshot: string|null}>}
+ * @throws {SyncError} 备份不存在、越界或还原后校验失败
+ */
+export async function restoreSessionFromBackup(input) {
+  const { sessionDir, backupPath, backupDir, sessionId } = input ?? {}
+  const log = input?.log
+
+  if (typeof sessionDir !== 'string' || sessionDir === '') {
+    throw new SyncError(ERROR_CODES.BAD_REQUEST, 'restoreSessionFromBackup 需要 sessionDir。')
+  }
+  if (typeof backupPath !== 'string' || backupPath === '') {
+    throw new SyncError(
+      ERROR_CODES.BACKUP_FAILED,
+      `会话 ${sessionId ?? '?'} 没有可用的备份路径，无法还原。`,
+      { hint: '没有备份就不能安全还原；请人工检查该会话目录。' }
+    )
+  }
+  if (typeof backupDir !== 'string' || backupDir === '') {
+    throw new SyncError(ERROR_CODES.BAD_REQUEST, 'restoreSessionFromBackup 需要 backupDir。')
+  }
+
+  const target = resolve(sessionDir)
+  const source = resolve(backupPath)
+  const backupRoot = resolve(backupDir)
+
+  // 备份目录必须真的在 backupDir 之内 —— 防调用方传错路径把别处的东西搬进来
+  if (!isInside(backupRoot, source)) {
+    throw new SyncError(
+      ERROR_CODES.PATH_UNSAFE,
+      `备份路径不在备份根目录内，拒绝还原：${backupPath}`
+    )
+  }
+
+  const sourceExists = await pathExists(source)
+  if (!sourceExists) {
+    throw new SyncError(
+      ERROR_CODES.BACKUP_FAILED,
+      `备份目录不存在，无法还原会话 ${sessionId ?? '?'}：${backupPath}`,
+      { hint: '请人工检查该会话目录；不要删除它，里面可能有用户历史。' }
+    )
+  }
+
+  // 记录还原前的事件数，便于调用方判断「确实回退了」
+  let eventsBefore = null
+  try {
+    const current = await readSessionDir(target, { frameDecoder: input?.frameDecoder })
+    eventsBefore = current.nextSeq
+  } catch {
+    // 目标不可读（可能已被删/损坏）—— 还原仍然有意义
+    eventsBefore = null
+  }
+
+  // 还原本身也可能失败，所以先把当前状态另存一份，别把仅剩的一致状态也毁掉
+  let safetySnapshot = null
+  if (await pathExists(target)) {
+    try {
+      safetySnapshot = await snapshotSessionDir(
+        target,
+        backupRoot,
+        `${assertSafeSessionId(sessionId ?? path.basename(target), 'sessionId')}.pre-restore`
+      )
+    } catch (error) {
+      log?.warn?.('session.restore.safety-snapshot-failed', {
+        sessionId,
+        message: error?.message ?? String(error),
+      })
+    }
+  }
+
+  // 用备份覆盖目标：先删再复制整目录（备份里可能有多代日志文件）
+  const entries = await readdir(source, { withFileTypes: true })
+  await mkdir(target, { recursive: true })
+  for (const entry of entries) {
+    if (!entry.isFile()) continue
+    const from = join(source, entry.name)
+    const to = join(target, assertSafeSegment(entry.name, '备份文件名'))
+    await writeFile(to, await readFile(from))
+  }
+
+  // 回读验证：必须能解析，且事件数与备份一致
+  const verified = await readSessionDir(target, { frameDecoder: input?.frameDecoder })
+  const expected = await readSessionDir(source, { frameDecoder: input?.frameDecoder }).then(
+    (r) => r.nextSeq,
+    () => null
+  )
+  if (expected !== null && verified.nextSeq !== expected) {
+    throw new SyncError(
+      ERROR_CODES.BACKUP_FAILED,
+      `还原后校验失败：备份里有 ${expected} 个事件，还原后读到 ${verified.nextSeq} 个。`,
+      { hint: `还原前的状态已另存到 ${safetySnapshot ?? '（未能保存）'}。` }
+    )
+  }
+
+  log?.info?.('session.restored', {
+    sessionId,
+    eventsBefore,
+    eventsAfter: verified.nextSeq,
+    backupPath,
+  })
+
+  return {
+    restored: true,
+    sessionId: sessionId ?? verified.id,
+    sessionDir: target,
+    eventsBefore,
+    eventsAfter: verified.nextSeq,
+    safetySnapshot,
   }
 }
 

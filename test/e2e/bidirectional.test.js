@@ -20,7 +20,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { decodeSessionEvents } from '../lib/zstd-frame.mjs';
+import { decodeSessionEvents, encodeFrames } from '../lib/zstd-frame.mjs';
 import {
   appendRounds,
   fixtureSessionId,
@@ -236,3 +236,261 @@ function toBuffer(value) {
   if (typeof value === 'string') return Buffer.from(value);
   throw new TypeError(`cannot interpret pulled payload as bytes: ${typeof value}`);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Anti-false-green tests.
+//
+// The two tests above pass. That is not enough: a suite that goes green when the
+// implementation degrades is worse than no suite, because it certifies a lie.
+// The tests below ask "would a BROKEN implementation fail this?"
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Read the `{path -> blob oid}` set of the sessions ref in `repo`. */
+function sessionsTreeOids(repoPath, ref) {
+  const result = execFileSync('git', ['-C', repoPath, 'ls-tree', '-r', '-z', ref], {
+    encoding: 'buffer',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  const map = new Map();
+  for (const line of result.toString('utf8').split('\0')) {
+    if (!line) continue;
+    const [meta, filePath] = line.split('\t');
+    const oid = meta.split(' ')[2];
+    if (filePath && oid) map.set(filePath, oid);
+  }
+  return map;
+}
+
+test('anti-false-green: a full rewrite instead of an append WOULD be detected', async (t) => {
+  if (!hasGit()) {
+    t.skip('git not installed');
+    return;
+  }
+  const transportModule = await loadTransport();
+  if (!transportModule) {
+    t.skip('src/transport.js not present yet');
+    return;
+  }
+
+  const base = mkdtempSync(join(tmpdir(), 'dsh-incr-'));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+
+  const remote = makeBareRemote(base);
+  const repoA = makeWorkingRepo(base, 'repo-a', remote);
+  const homeA = makeTempDshHome(base);
+  t.after(() => homeA.dispose());
+
+  // A session big enough to span several chunks. Small fixtures collapse into a
+  // single chunk, which makes incremental reuse unobservable — verified: 40
+  // rounds -> 1 chunk, 80 rounds -> 2 chunks.
+  const sessionId = fixtureSessionId(11);
+  const sessionA = writeSession({ dshHome: homeA.root, sessionId, cwd: repoA, rounds: 80 });
+
+  const transport = transportModule.createTransport();
+  await transport.push({ repoPath: repoA }, bundleFor([sessionA]));
+  const ref = transportModule.SESSIONS_REF;
+  const afterFirst = sessionsTreeOids(repoA, ref);
+  assert.ok(afterFirst.size > 2, `expected several chunk blobs, got ${afterFirst.size}`);
+
+  // Append one round and push again.
+  const lastSeq = Math.max(
+    ...readEvents(sessionA).filter((e) => typeof e.seq === 'number').map((e) => e.seq),
+  );
+  appendRounds({ file: sessionA.file, fromRound: 81, nextSeq: lastSeq + 1, rounds: 1 });
+  const push2 = await transport.push({ repoPath: repoA }, bundleFor([sessionA]));
+  assert.equal(push2.ok, true);
+
+  const afterSecond = sessionsTreeOids(repoA, ref);
+
+  // The decisive observation: blobs whose content is unchanged keep their oid,
+  // because a git blob id IS a content hash. So counting shared oids measures
+  // "did we really only upload the delta?" independently of git's packing.
+  const shared = [...afterSecond.entries()].filter(([p, oid]) => afterFirst.get(p) === oid).length;
+
+  assert.ok(
+    shared > 0,
+    `appending one round must REUSE the unchanged chunk blobs; got shared=${shared} ` +
+      '(a full-rewrite implementation would show shared=0 here)',
+  );
+});
+
+test('anti-false-green: byte-identity would NOT hold across machines, event equality must', async (t) => {
+  // Documents why the incremental assertion above uses blob oids and event
+  // equality rather than whole-file byte equality:
+  //   - within one machine, an append keeps the old bytes as a prefix
+  //   - across machines, cwd is rewritten, so bytes legitimately differ
+  // A suite that demanded byte equality cross-machine would report a false bug.
+  const base = mkdtempSync(join(tmpdir(), 'dsh-bytes-'));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+
+  const homeA = makeTempDshHome(base);
+  const homeB = makeTempDshHome(base);
+  t.after(() => {
+    homeA.dispose();
+    homeB.dispose();
+  });
+
+  const sessionId = fixtureSessionId(12);
+  // Same conversation, different cwd on each machine — exactly the cross-machine case.
+  const sessionA = writeSession({ dshHome: homeA.root, sessionId, cwd: '/tmp/qa-fixture/machine-a', rounds: 3 });
+  const sessionB = writeSession({ dshHome: homeB.root, sessionId, cwd: '/tmp/qa-fixture/machine-b', rounds: 3 });
+
+  const bytesA = readFileSync(sessionA.file);
+  const bytesB = readFileSync(sessionB.file);
+
+  // Bytes differ because the header records cwd.
+  assert.equal(
+    bytesA.equals(bytesB),
+    false,
+    'files with different cwd must not be byte-identical — this is why byte equality is the wrong cross-machine assertion',
+  );
+
+  // But the *conversation* is identical at the logical level.
+  const logical = (events) =>
+    events
+      .filter((e) => e.type !== 'session')
+      .map((e) => ({ type: e.type, seq: e.seq }));
+  assert.deepEqual(
+    logical(decodeSessionEvents(bytesA)),
+    logical(decodeSessionEvents(bytesB)),
+    'the event stream must be logically identical even though bytes differ',
+  );
+});
+
+test('meta: the incremental assertion is proven to catch a full-rewrite regression', async (t) => {
+  // A test that can never fail is worthless. This one deliberately builds a
+  // MUTANT — a session file rewritten with fresh bytes instead of appended — and
+  // asserts that the "shared blob oid" signal drops to zero for it.
+  //
+  // If this ever stops holding, the anti-false-green test above has silently
+  // become decoration, so the guard belongs here next to it.
+  if (!hasGit()) {
+    t.skip('git not installed');
+    return;
+  }
+  const transportModule = await loadTransport();
+  if (!transportModule) {
+    t.skip('src/transport.js not present yet');
+    return;
+  }
+
+  const base = mkdtempSync(join(tmpdir(), 'dsh-mutant-'));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const home = makeTempDshHome(base);
+  t.after(() => home.dispose());
+
+  const runScenario = async (name, mutate) => {
+    const remote = makeBareRemote(join(base, name));
+    const repo = makeWorkingRepo(base, name, remote);
+    const session = writeSession({ dshHome: home.root, sessionId: fixtureSessionId(13), cwd: repo, rounds: 80 });
+    const transport = transportModule.createTransport();
+    const bundle = () => ({
+      sessions: [{ sessionId: session.sessionId, content: readFileSync(session.file) }],
+    });
+
+    await transport.push({ repoPath: repo }, bundle());
+    const before = sessionsTreeOids(repo, transportModule.SESSIONS_REF);
+
+    if (mutate) {
+      // Rewrite the whole log with freshly encoded bytes: every chunk changes.
+      const events = decodeSessionEvents(readFileSync(session.file));
+      writeFileSync(session.file, encodeFrames(events.map((e) => JSON.stringify(e) + '\n')));
+    } else {
+      const lastSeq = Math.max(
+        ...readEvents(session).filter((e) => typeof e.seq === 'number').map((e) => e.seq),
+      );
+      appendRounds({ file: session.file, fromRound: 81, nextSeq: lastSeq + 1, rounds: 1 });
+    }
+
+    await transport.push({ repoPath: repo }, bundle());
+    const after = sessionsTreeOids(repo, transportModule.SESSIONS_REF);
+    return [...after.entries()].filter(([p, oid]) => before.get(p) === oid).length;
+  };
+
+  const sharedOnAppend = await runScenario('mut-append', false);
+  const sharedOnRewrite = await runScenario('mut-rewrite', true);
+
+  assert.ok(
+    sharedOnAppend > 0,
+    `a real append must reuse chunks (shared=${sharedOnAppend})`,
+  );
+  assert.equal(
+    sharedOnRewrite,
+    0,
+    `a full rewrite must reuse nothing (shared=${sharedOnRewrite}) — if this holds, ` +
+      'the incremental assertion below can distinguish the two',
+  );
+  assert.ok(
+    sharedOnAppend > sharedOnRewrite,
+    'the append-vs-rewrite signal must be distinguishable; otherwise the incremental ' +
+      'test cannot detect a regression',
+  );
+});
+
+test('e2e: push reports real new vs reused chunk counts (increment is observable)', async (t) => {
+  // The transport used to report `newChunks` as "how many times we called
+  // hash-object", which equals the total chunk count on every push. That made
+  // the field useless for detecting a regression to full-rewrite behaviour.
+  //
+  // It now reports actual new-vs-reused, so these assertions are meaningful:
+  //   - a genuine append MUST reuse chunks
+  //   - the parts must add up to the whole
+  //   - a no-op push must add nothing
+  if (!hasGit()) {
+    t.skip('git not installed');
+    return;
+  }
+  const transportModule = await loadTransport();
+  if (!transportModule) {
+    t.skip('src/transport.js not present yet');
+    return;
+  }
+
+  const base = mkdtempSync(join(tmpdir(), 'dsh-chunks-'));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+
+  const remote = makeBareRemote(base);
+  const repoA = makeWorkingRepo(base, 'repo-a', remote);
+  const homeA = makeTempDshHome(base);
+  t.after(() => homeA.dispose());
+
+  // Large enough to span several chunks; small fixtures collapse to one chunk
+  // and make reuse unobservable (measured: 40 rounds -> 1 chunk, 80 -> 2).
+  const sessionId = fixtureSessionId(31);
+  const sessionA = writeSession({ dshHome: homeA.root, sessionId, cwd: repoA, rounds: 80 });
+  const transport = transportModule.createTransport();
+
+  const first = await transport.push({ repoPath: repoA }, bundleFor([sessionA]));
+  assert.equal(first.ok, true);
+  assert.ok(first.chunks > 1, `expected multiple chunks, got ${first.chunks}`);
+  assert.equal(first.newChunks, first.chunks, 'the very first push has nothing to reuse');
+  assert.equal(first.reusedChunks ?? 0, 0, 'nothing exists remotely yet, so nothing can be reused');
+
+  // Append one round: only the tail chunk should change.
+  const lastSeq = Math.max(
+    ...readEvents(sessionA).filter((e) => typeof e.seq === 'number').map((e) => e.seq),
+  );
+  appendRounds({ file: sessionA.file, fromRound: 81, nextSeq: lastSeq + 1, rounds: 1 });
+  const second = await transport.push({ repoPath: repoA }, bundleFor([sessionA]));
+  assert.equal(second.ok, true);
+
+  assert.equal(
+    (second.newChunks ?? 0) + (second.reusedChunks ?? 0),
+    second.chunks,
+    'newChunks + reusedChunks must account for every chunk',
+  );
+  assert.ok(
+    second.newChunks < second.chunks,
+    `appending one round must NOT re-upload every chunk (newChunks=${second.newChunks}, chunks=${second.chunks}). ` +
+      'If these are equal, the implementation rewrote the whole payload and the incremental claim is false.',
+  );
+  assert.ok(
+    (second.reusedChunks ?? 0) > 0,
+    `appending must reuse existing chunks; reusedChunks=${second.reusedChunks}`,
+  );
+
+  // A push with nothing changed must add zero new chunks.
+  const third = await transport.push({ repoPath: repoA }, bundleFor([sessionA]));
+  assert.equal(third.ok, true);
+  assert.equal(third.newChunks, 0, 'an unchanged push must not create new chunks');
+});

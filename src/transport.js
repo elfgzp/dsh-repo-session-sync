@@ -571,6 +571,8 @@ export function createTransport(context = {}) {
           ? ls.stdout.toString('utf8').trim().split(/\s+/)[0]
           : null
 
+      const totalChunks = planned.reduce((a, p) => a + p.chunkRefs.length, 0)
+
       const manifest = {
         formatVersion: PAYLOAD_VERSION,
         refNamespace: SESSIONS_REF,
@@ -605,6 +607,16 @@ export function createTransport(context = {}) {
         }
       }
 
+      // ── 读远端已有对象集合：用来区分「新增」与「复用」 ──
+      //
+      // 为什么需要它：`hash-object -w` 对已存在的内容不会真写新对象（返回同一个
+      // oid），所以磁盘上不浪费；但我们回报给用户的数字必须是「**真正新增了几个
+      // 块**」，否则「增量是否生效」就没有任何可观测信号 —— 一个恒等于块总数的
+      // 字段，等于把唯一的回归断言点丢掉了。
+      //
+      // 只读操作，dry-run 也做，这样预演才能回答「这次会传多少」。
+      const existingOids = await collectTreeOids(repoPath, previousHead, git)
+
       // ── dry-run：到此为止，不写任何东西 ──
       if (dryRun) {
         log.info('transport.push.dry-run', { sessions: planned.length, bytes: totalBytes })
@@ -616,32 +628,49 @@ export function createTransport(context = {}) {
           bytes: totalBytes,
           head: previousHead,
           previousHead,
-          chunks: planned.reduce((a, p) => a + p.chunkRefs.length, 0),
-          newChunks: 0,
+          chunks: totalChunks,
+          // 预演也要给出**真实预估**：dry-run 的价值就在回答「这次会传多少」。
+          // 这里按内容 sha256 无法直接比 oid（oid 要算出来才有），所以先算一遍
+          // oid 再与远端对比 —— 只是 hash 计算，不写任何对象。
+          ...(await estimateChunkDelta(planned, existingOids, repoPath, git)),
           sessions: planned.map((p) => ({
             sessionId: p.sessionId,
             chunks: p.chunks,
             bytes: p.bytes,
             frameCount: p.frameCount,
           })),
-          message: `[dry-run] 将上行 ${planned.length} 个会话，共 ${totalBytes} 字节（未写入）。`,
+          message:
+            `[dry-run] 将上行 ${planned.length} 个会话，共 ${totalBytes} 字节` +
+            `（${totalChunks} 个块，未写入）。`,
         }
       }
 
       // ── 真正写入：先写所有 blob，再建 tree，再提交 ──
       let newChunks = 0
+      let reusedChunks = 0
       /** @type {Map<string, string>} digest → git object id */
       const objectIds = new Map()
 
       for (const plan of planned) {
+        plan.newChunks = 0
+        plan.reusedChunks = 0
         for (const chunk of plan.chunkRefs) {
-          if (objectIds.has(chunk.digest)) continue
-          // --literally=false（默认）会校验对象格式；用 stdin 传二进制避免临时文件
-          const oid = await hashObject(repoPath, chunk.data, git)
-          objectIds.set(chunk.digest, oid)
-          newChunks += 1
+          let oid = objectIds.get(chunk.digest)
+          if (oid === undefined) {
+            // --literally=false（默认）会校验对象格式；用 stdin 传二进制避免临时文件
+            oid = await hashObject(repoPath, chunk.data, git)
+            objectIds.set(chunk.digest, oid)
+          }
+          // 计数看的是「远端原本有没有这个对象」，不是「本次写了几次」。
+          // 这才能区分「增量生效」和「退化成全量重写」。
+          if (existingOids.has(oid)) {
+            reusedChunks += 1
+            plan.reusedChunks += 1
+          } else {
+            newChunks += 1
+            plan.newChunks += 1
+          }
         }
-        plan.newChunks = plan.chunkRefs.filter((c) => objectIds.has(c.digest)).length
       }
 
       const manifestOid = await hashObject(repoPath, manifestBytes, git)
@@ -737,11 +766,14 @@ export function createTransport(context = {}) {
         bytes: totalBytes,
         head: commitOid,
         previousHead,
-        chunks: planned.reduce((a, p) => a + p.chunkRefs.length, 0),
+        chunks: totalChunks,
         newChunks,
+        reusedChunks,
         sessions: planned.map((p) => ({
           sessionId: p.sessionId,
           chunks: p.chunks,
+          newChunks: p.newChunks,
+          reusedChunks: p.reusedChunks,
           bytes: p.bytes,
           frameCount: p.frameCount,
         })),
@@ -999,6 +1031,73 @@ function normalizeSessions(bundle) {
  */
 function safeSessionDirName(sessionId) {
   return 's-' + createHash('sha256').update(`session:${sessionId}`).digest('hex').slice(0, 32)
+}
+
+/**
+ * 读出一个 ref（或任意 commit-ish）下所有 blob 的 oid 集合。
+ *
+ * 用来回答「远端已经有哪些对象」，从而区分「本次新增」与「复用」。
+ * 只读操作，dry-run 也安全调用。
+ *
+ * @param {string} repoPath 仓库路径
+ * @param {string|null} rev commit-ish；null 表示远端还没有会话数据
+ * @param {Function} git git 执行器
+ * @returns {Promise<Set<string>>} oid 集合（空集合表示什么都没有）
+ */
+async function collectTreeOids(repoPath, rev, git) {
+  const oids = new Set()
+  if (typeof rev !== 'string' || rev === '') return oids
+
+  // `%(objectname)` 只输出 oid，比解析完整 ls-tree 输出更稳
+  const result = await git(repoPath, ['ls-tree', '-r', '--format=%(objectname)', rev], {
+    allowFailure: true,
+  })
+  if (result.code !== 0) return oids
+
+  for (const line of result.stdout.toString('utf8').split('\n')) {
+    const oid = line.trim()
+    if (oid !== '') oids.add(oid)
+  }
+  return oids
+}
+
+/**
+ * dry-run 时预估「新增/复用」块数。
+ *
+ * 需要先算 oid（纯计算，`hash-object` 不带 `-w` 不写对象）才能和远端已有集合比对。
+ * 之所以要费这份计算：dry-run 的价值就在于回答「这次会传多少」，
+ * 一个恒为 0 的字段没有决策价值。
+ *
+ * @param {Array<object>} planned 计划上传的会话
+ * @param {Set<string>} existingOids 远端已有 oid
+ * @param {string} repoPath 仓库路径
+ * @param {Function} git git 执行器
+ * @returns {Promise<{newChunks: number, reusedChunks: number}>}
+ */
+async function estimateChunkDelta(planned, existingOids, repoPath, git) {
+  let newChunks = 0
+  let reusedChunks = 0
+  const seen = new Set()
+
+  for (const plan of planned) {
+    for (const chunk of plan.chunkRefs) {
+      if (seen.has(chunk.digest)) {
+        // 同一次推送内重复的块只算一次（与真正写入阶段的去重口径一致）
+        continue
+      }
+      seen.add(chunk.digest)
+      // 不带 -w：只计算 oid，不写对象 —— dry-run 必须零副作用
+      const result = await git(repoPath, ['hash-object', '--stdin'], {
+        input: chunk.data,
+        allowFailure: true,
+      })
+      const oid = result.code === 0 ? result.stdout.toString('utf8').trim() : ''
+      if (oid !== '' && existingOids.has(oid)) reusedChunks += 1
+      else newChunks += 1
+    }
+  }
+
+  return { newChunks, reusedChunks }
 }
 
 /** 块文件的单段文件名（定宽序号，tree 里天然按序）。 */
