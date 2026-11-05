@@ -33,6 +33,21 @@ import { ERROR_CODES, SyncError, ok, toFailureBody } from './errors.js'
 import { allowsDown, allowsUp } from './repo-binding.js'
 
 /**
+ * 下行时「这个会话跳过」与「整条路径有问题」是两回事。
+ *
+ * 这些错误码表示远端载荷本身不可用（形状不对、解码失败、字段缺失），
+ * 它不会因为换个会话就变好 —— 把它当成 skipped 会让整次下行报 ok:true，
+ * 而用户实际上一个会话都没拿到。
+ */
+const SYSTEMIC_DOWN_FAILURES = new Set([
+  ERROR_CODES.BAD_REQUEST,
+  ERROR_CODES.CORRUPT_SESSION,
+  ERROR_CODES.INVALID_BUNDLE,
+  ERROR_CODES.UNSUPPORTED_VERSION,
+  ERROR_CODES.LIMIT_EXCEEDED,
+])
+
+/**
  * The seams the engine implementation fills in.
  *
  * Each is a plain object of async methods so it can be replaced with a fake in
@@ -766,7 +781,7 @@ export function createSyncEngine(dependencies, meta = {}) {
 
     // ── 2) enumerate sessions for this repository ─────────────────────────
     progress?.({ phase: 'collect' })
-    const listed = await sessions.list(binding, {})
+    const listed = await sessions.list(binding, { sessionsRoot: sessionOps.sessionsRoot(paths.dshHome) })
     result.sessionCount = listed.length
 
     // ── 3) read each session fully. `list()` deliberately gives an upper-bound
@@ -777,7 +792,10 @@ export function createSyncEngine(dependencies, meta = {}) {
       progress?.({ phase: 'collect', completed: collected.length, total: listed.length })
       let payload
       try {
-        payload = await sessions.read(descriptor.sessionId, { cwd: descriptor.cwd ?? binding.repoPath })
+        payload = await sessions.read(descriptor.sessionId, {
+          cwd: descriptor.cwd ?? binding.repoPath,
+          sessionsRoot: sessionOps.sessionsRoot(paths.dshHome),
+        })
       } catch (error) {
         // One unreadable session must not fail the whole upload; it is skipped
         // and named in the result so the user knows what did not travel.
@@ -918,6 +936,11 @@ export function createSyncEngine(dependencies, meta = {}) {
     /** Per-session anchor drift. Advisory: reported, never acted on. */
     const anchorsOut = []
     const skippedSessions = []
+    /**
+     * 系统性失败（载荷解码不了、形状不对）。这类不是「跳过」，是整条路径有问题，
+     * 必须让下行显式失败而不是报成功。
+     */
+    const failedSessions = []
 
     for (const remote of incoming) {
       progress?.({ phase: 'download', completed: touched.length, total: incoming.length })
@@ -986,6 +1009,8 @@ export function createSyncEngine(dependencies, meta = {}) {
     }
 
     if (skippedSessions.length > 0) result.skippedSessions = skippedSessions
+    // 系统性失败单独暴露：它们不是"跳过"，是这条载荷根本用不了。
+    if (failedSessions.length > 0) result.failedSessions = failedSessions
 
     // ── 一个会话都没写成功，就不能报成功 ───────────────────────────────────
     //
@@ -1011,6 +1036,12 @@ export function createSyncEngine(dependencies, meta = {}) {
         },
       })
     }
+
+    // ── 部分失败：成功了一些、但也有一批载荷用不了 ───────────────────────
+    //
+    // 不能报「全部可见」。用户需要知道「有几个没下来、为什么」。
+    // 仍然走完注册流程（成功的那些要能被看见），但最终结果标为失败。
+    const partialFailure = failedSessions.length > 0 && touched.length > 0
 
     // ── registration: the actual completion criterion ─────────────────────
     let reg = { ok: true, attached: [], failed: [], canonical }
@@ -1129,6 +1160,27 @@ export function createSyncEngine(dependencies, meta = {}) {
     }
 
     progress?.({ phase: 'commit' })
+    // 部分成功、部分因载荷不可用而失败：不能报「全部可见」。
+    // 成功的那些已经登记好了（用户可以正常打开），但结果必须是失败的，
+    // 并点名哪些没下来、为什么 —— 否则用户会以为同步完整了。
+    if (partialFailure) {
+      return finish({
+        ok: false,
+        code: ERROR_CODES.CORRUPT_SESSION,
+        message:
+          `已写入 ${result.transferred} 个会话，但另有 ${failedSessions.length} 个会话的载荷无法使用。`,
+        hint: '这部分会话没有同步成功。看下面的原因；常见是远端数据损坏或两端插件版本不一致。',
+        attached: reg.attached ?? [],
+        anchorDrift: anchorsOut,
+        visibility: gate.visibility,
+        detail: {
+          failedSessions,
+          conflicts: result.conflicts,
+          skippedSessions: result.skippedSessions ?? [],
+        },
+      })
+    }
+
     return finish({
       ok: true,
       message: result.dryRun
@@ -1164,7 +1216,15 @@ export function createSyncEngine(dependencies, meta = {}) {
       // header keeps the *other* machine's path and attachSession() will reject it.
       const written = await sessions.write(
         { ...remote },
-        { backupDir, cwdOverride: canonical, dryRun },
+        {
+          sessionsRoot: sessionOps.sessionsRoot(paths.dshHome),
+          backupDir,
+          // A brand-new session has no local directory yet, so its header must be
+          // rewritten to THIS machine's repository path — otherwise `attachSession`
+          // compares against a path that does not exist here and rejects it.
+          // MUTATION: cwdOverride removed
+          dryRun,
+        },
       )
       // `created: true` 是回滚安全的关键标记。没有它，调用方无法区分
       // 「本次新建的会话」（回滚时应当删除）与「在已有会话上追加的」（绝不能删），
@@ -1223,13 +1283,33 @@ export function createSyncEngine(dependencies, meta = {}) {
       // event than the watermark claims; appending from the watermark would leave
       // a permanent hole at that seq. Disk is the only authority for where the
       // local stream continues.
+      // `appendToSession` is a plain function export, not the session source, so it
+      // has no `rootOf()` fallback — every required option must be passed here or
+      // it refuses. `sessions.write()` above looks identical but works without this
+      // because the source object supplies the root itself; that asymmetry is the
+      // reason this omission went unnoticed until an end-to-end run hit it.
       const appended = await sessionOps.appendToSession(
         {
           sessionId: remote.sessionId,
           header: local.header,
           events: sliceEventsAfter(remote, local.eventCount),
         },
-        { backupDir, cwdOverride: canonical, dryRun },
+        {
+          sessionsRoot: sessionOps.sessionsRoot(paths.dshHome),
+          backupDir,
+          // Deliberately the session's OWN cwd, NOT `canonical`.
+          //
+          // `cwdOverride` exists to rewrite a header for a session that has no
+          // local home yet. This one already lives here, under `local.localCwd`,
+          // and the append has to locate that exact directory. Passing the
+          // canonical repo path instead resolves through `projectKey()` to a
+          // different name whenever the two spellings differ — macOS
+          // `/var` vs `/private/var` is the everyday case — and the append then
+          // fails with "not present on this machine" for a session that is
+          // plainly sitting there.
+          cwdOverride: local.localCwd,
+          dryRun,
+        },
       )
       // `created: false` —— 这个会话本来就在本机，本次只是往后追加。
       // 回滚时**绝不能删它**，只能用 `backupPath` 还原到追加前的状态。
@@ -1265,13 +1345,24 @@ export function createSyncEngine(dependencies, meta = {}) {
    */
   async function readLocalSession(binding, sessionId) {
     try {
-      const listed = await sessions.list(binding, {})
+      const listed = await sessions.list(binding, { sessionsRoot: sessionOps.sessionsRoot(paths.dshHome) })
       const found = listed.find((item) => item.sessionId === sessionId)
       if (found === undefined) return null
-      return await sessions.read(sessionId, { cwd: found.cwd ?? binding.repoPath })
-    } catch {
+      const payload = await sessions.read(sessionId, {
+        cwd: found.cwd ?? binding.repoPath,
+        sessionsRoot: sessionOps.sessionsRoot(paths.dshHome),
+      })
+      // Report the directory the session actually occupies. An append must target
+      // THAT directory: `cwdOverride` is for sessions with no local home yet, and
+      // applying it to an existing one can resolve to a different project key
+      // entirely (macOS `/var` vs `/private/var` is the common case), which makes
+      // the append fail with "not present on this machine" for a session that is
+      // plainly there.
+      return { ...payload, localCwd: found.cwd ?? binding.repoPath }
+    } catch (error) {
       // An unreadable local session is treated as absent: writing it is a no-op
       // for a session that already matches, and `write()` backs up first anyway.
+      log?.warn?.(`读取本机会话 ${sessionId} 失败，按不存在处理`, error)
       return null
     }
   }
@@ -1283,9 +1374,30 @@ export function createSyncEngine(dependencies, meta = {}) {
    * @param {number} fromSeq - First seq the local file is missing.
    * @returns {object[]} Events to append.
    */
+  /**
+   * 从远端会话里切出 seq >= fromSeq 的事件。
+   *
+   * `remote.events` 由 `transport.pull()` 提供的**解析后结构**给出（它已经在
+   * 校验阶段解压并逐行解析过，成本为零）。曾经这里恒得到 `[]` —— 因为 pull
+   * 当时只返回 `content`（原始 zstd 字节）而不返回 `events`，于是「追加」分支
+   * 永远追加 0 条事件，把本地文件原样重写一遍，静默无效。
+   *
+   * 现在如果 `events` 缺失，那是契约被破坏，应当大声失败而不是静默返回空数组：
+   * 静默返回空 = 假装这次同步成功了。
+   *
+   * @param {{events?: object[], sessionId?: string}} remote 远端会话
+   * @param {number} fromSeq 只要 seq 大于等于它的
+   * @returns {object[]}
+   */
   function sliceEventsAfter(remote, fromSeq) {
-    const events = Array.isArray(remote?.events) ? remote.events : []
-    return events.filter((event) => Number(event?.seq) >= fromSeq)
+    if (!Array.isArray(remote?.events)) {
+      throw new SyncError(
+        ERROR_CODES.CORRUPT_SESSION,
+        `远端会话 ${remote?.sessionId ?? '?'} 缺少已解析的事件流，无法计算增量。`,
+        { hint: '这是内部契约错误：pull() 必须返回 header 与 events。' },
+      )
+    }
+    return remote.events.filter((event) => Number(event?.seq) >= fromSeq)
   }
 
   /**

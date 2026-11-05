@@ -140,6 +140,7 @@ async function makeEngine(options) {
       },
       async write(payload, opts) {
         order.push('sessions.write')
+        if (options.writeThrows === true) throw new Error('写入失败')
         writeSpy?.(payload, opts)
         // Mirrors the real contract: `backupPath` is null only when the target did
         // not exist. The engine derives `created` from exactly this, so a fake that
@@ -164,6 +165,9 @@ async function makeEngine(options) {
         }
       },
       classifyIncoming(local, remote) {
+        if (typeof options.classifyIncoming === 'function') {
+          return options.classifyIncoming(local, remote)
+        }
         if (typeof options.classifyIncomingImpl === 'function') {
           return options.classifyIncomingImpl(local, remote)
         }
@@ -731,7 +735,7 @@ test('down：本机领先远端 → 跳过（等下次上行），不能报成 g
 
     const result = await engine.down({ repoId: binding.id })
 
-    assert.equal(result.ok, true, '本机领先是正常状态，不该失败')
+    assert.equal(result.ok, true, `本机领先是正常状态，不该失败；实际：${JSON.stringify({code:result.code,message:result.message,conflicts:result.conflicts})}`)
     assert.equal(result.conflicts.length, 0, '本机领先不能被报成冲突')
     assert.equal(result.transferred, 0, '本机更全，不需要写入')
   })
@@ -860,5 +864,67 @@ test('down：远端没带锚点时不做漂移计算（不要编造提示）', a
     assert.equal(called, false, '没有锚点就不该去比对')
     assert.deepEqual(result.anchorDrift, [])
     assert.equal(result.ok, true)
+  })
+})
+
+test('down：全部已是最新 → 成功（零写入不等于失败）', async () => {
+  await withScenario(async ({ dir, binding, store }) => {
+    // The single most common download: nothing changed since the last sync. It
+    // writes no files, and that must read as success. Reporting it as "nothing was
+    // written" would make a healthy, everyday no-op look like a broken sync.
+    const { engine } = await makeEngine({
+      dir,
+      binding,
+      store,
+      remoteSessions: [
+        { sessionId: 'sess-same', eventCount: 3, content: Buffer.from('s'), events: [{ seq: 0 }] },
+      ],
+      localList: [{ sessionId: 'sess-same', cwd: dir }],
+      localRead: () => ({
+        sessionId: 'sess-same',
+        eventCount: 3,
+        header: { type: 'session', id: 'sess-same', cwd: dir },
+        events: [{ seq: 0 }, { seq: 1 }, { seq: 2 }],
+      }),
+      decide: () => ({ kind: 'no-conflict', reason: 'clean' }),
+      registryOutcome: { attached: [] },
+      classifyIncoming: () => ({ action: 'up-to-date', reason: 'covered' }),
+    })
+
+    const result = await engine.down({ repoId: binding.id })
+
+    assert.equal(result.ok, true, '已是最新是正常结果')
+    assert.equal(result.transferred, 0)
+    assert.equal(result.failed, 0, '没有失败')
+    assert.ok(result.unchanged >= 1, '应计入 unchanged 而不是 failed')
+  })
+})
+
+test('down：全部会话处理失败（非良性跳过）→ 必须报失败', async () => {
+  await withScenario(async ({ dir, binding, store }) => {
+    // The mirror case, and the reason the zero-write guard exists: every session
+    // errored during processing, so nothing was written AND nothing is visible.
+    // Silently succeeding here would tell the user "全部可见" while the sidebar
+    // stays empty.
+    const { engine } = await makeEngine({
+      dir,
+      binding,
+      store,
+      remoteSessions: [
+        { sessionId: 'sess-boom', eventCount: 2, content: Buffer.from('b'), events: [{ seq: 0 }] },
+      ],
+      localList: [{ sessionId: 'sess-boom', cwd: dir }],
+      localRead: () => {
+        throw new Error('本地会话不可读')
+      },
+      writeThrows: true,
+      decide: () => ({ kind: 'no-conflict', reason: 'clean' }),
+      registryOutcome: { attached: [] },
+    })
+
+    const result = await engine.down({ repoId: binding.id })
+
+    assert.equal(result.ok, false, '零写入且有失败，不能报成功')
+    assert.ok(result.failed >= 1, '失败必须计入 failed')
   })
 })
