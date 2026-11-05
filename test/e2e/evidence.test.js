@@ -36,6 +36,24 @@ function tempDir(t) {
   return dir;
 }
 
+/**
+ * Writing sessions needs the native zstd compressor (Node >= 22.15).
+ *
+ * This is a deliberate product decision, not a gap: writing an uncompressed
+ * fallback would produce files DSH cannot read, and this code writes real user
+ * data. So on an older runtime `down()` correctly refuses to write, and an
+ * end-to-end write assertion cannot be exercised. The CI matrix runs both
+ * runtimes explicitly (20.x covers the pure-JS read path, 22.15 covers writes).
+ */
+async function canWriteSessions() {
+  try {
+    const zlib = await import('node:zlib');
+    return typeof zlib.default.zstdCompressSync === 'function';
+  } catch {
+    return false;
+  }
+}
+
 function hasGit() {
   try {
     execFileSync('git', ['--version'], { stdio: 'ignore' });
@@ -95,6 +113,30 @@ async function buildEngine({ home, registrySessionIds }) {
   const log = { info() {}, warn() {}, error() {} };
   const deps = await depsMod.assembleDependencies({ store, paths, log });
   deps.visibility = permissiveVisibility();
+
+  // The engine has no `frameEncoder` seam, but `sessions.write` does. When the
+  // runtime lacks native zstd (Node < 22.15) the production encoder refuses to
+  // write at all — correct, since it must not emit a file DSH cannot read. For
+  // the test we wrap `write` and supply a zero-dependency encoder that produces
+  // SPEC-COMPLIANT frames, so the end-to-end path is exercised on every runtime
+  // instead of being skipped. (A skip would verify nothing.)
+  if (!(await canWriteSessions())) {
+    const { encodeFrame } = await import('../lib/zstd-frame.mjs');
+    const encoded = (buf) => encodeFrame(buf);
+
+    // Both write entry points need it: `sessions.write` for new sessions and
+    // `sessionOps.appendToSession` for the append path.
+    if (deps.sessions && typeof deps.sessions.write === 'function') {
+      const originalWrite = deps.sessions.write.bind(deps.sessions);
+      deps.sessions.write = (payload, opts = {}) =>
+        originalWrite(payload, { ...opts, frameEncoder: opts.frameEncoder ?? encoded });
+    }
+    if (deps.sessionOps && typeof deps.sessionOps.appendToSession === 'function') {
+      const originalAppend = deps.sessionOps.appendToSession.bind(deps.sessionOps);
+      deps.sessionOps.appendToSession = (payload, opts = {}) =>
+        originalAppend(payload, { ...opts, frameEncoder: opts.frameEncoder ?? encoded });
+    }
+  }
 
   const engine = engineMod.createSyncEngine(deps, {
     pluginVersion: '0.0.0-test',
