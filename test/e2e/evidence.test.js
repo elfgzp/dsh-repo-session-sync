@@ -110,7 +110,18 @@ async function buildEngine({ home, registrySessionIds }) {
   const paths = pathsMod.resolvePaths({ dshHome: home.root });
   mkdirSync(paths.stateDir, { recursive: true });
   const store = new storeMod.StateStore(paths);
-  const log = { info() {}, warn() {}, error() {} };
+  // Collect instead of discarding. The engine logs the *real* error (with its
+  // cause) via log.error() and returns only a sanitized body to the caller, so a
+  // no-op logger destroys the only record of why a step failed. That is exactly
+  // what made an intermittent e2e failure unreadable: the body said
+  // 'internal-error' and the reason had been thrown away. Callers can now dump
+  // these lines when an assertion fails.
+  const logs = [];
+  const log = {
+    info() {},
+    warn(...args) { logs.push(['warn', ...args]); },
+    error(...args) { logs.push(['error', ...args]); },
+  };
   const deps = await depsMod.assembleDependencies({ store, paths, log });
   deps.visibility = permissiveVisibility();
 
@@ -143,7 +154,24 @@ async function buildEngine({ home, registrySessionIds }) {
     config: {},
     getWorkspaceRegistry: () => attachedRegistry(registrySessionIds),
   });
-  return { engine, store, paths };
+  return { engine, store, paths, logs };
+}
+
+/** Render collected engine logs for an assertion message. */
+function dumpLogs(logs) {
+  if (!Array.isArray(logs) || logs.length === 0) return '(none)';
+  const render = (v) => {
+    if (v instanceof Error) return `${v.name}: ${v.message}\n${v.stack}`;
+    if (v !== null && typeof v === 'object') {
+      // The engine logs a context object whose `error` field carries the cause.
+      const inner = v.error instanceof Error
+        ? ` ${v.error.name}: ${v.error.message}\n${v.error.stack}`
+        : '';
+      return `${JSON.stringify(v, (k, val) => (val instanceof Error ? `${val.name}: ${val.message}` : val))}${inner}`;
+    }
+    return String(v);
+  };
+  return logs.map((entry) => entry.map(render).join(' | ')).join('\n');
 }
 
 /** Find a session file on disk by id, without relying on the directory encoding. */
@@ -328,7 +356,7 @@ test('evidence: appending pulls only the missing rounds (2 rounds + 1 new = 3, n
   assert.equal(
     down.ok,
     true,
-    `down failed: ${JSON.stringify(down)}. ` +
+    `down failed: ${JSON.stringify(down)}\n--- engine logs ---\n${dumpLogs(built.logs)}. ` +
       'A local session file alone is not enough for the engine to consider the repo usable; ' +
       'the failure reason is in skippedSessions.',
   );

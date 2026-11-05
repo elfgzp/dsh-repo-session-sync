@@ -1014,6 +1014,21 @@ export function createSyncEngine(dependencies, meta = {}) {
       } catch (error) {
         const body = toFailureBody(error)
 
+        // 把**真实错误连同 cause**写进日志，再往下分类。
+        //
+        // 这一行曾经缺失：`toFailureBody` 只给出脱敏后的 body（面向浏览器的
+        // 信任边界，这是对的），而 `internal-error` 的 message 是固定文案
+        // 「插件内部错误，操作已中止」，hint 又说「详情已写入插件日志」——
+        // 可实际上没有任何地方写过日志。结果是一次偶发 e2e 失败只留下
+        // `reason: "internal-error"`，真因被彻底吞掉。
+        //
+        // 脱敏只该作用于**跨信任边界**的返回值，不该作用于我们自己的日志。
+        log?.error?.('down: 处理会话失败', {
+          sessionId: remote.sessionId,
+          code: body.code,
+          error,
+        })
+
         // 不是所有错误都等于「这个会话可以跳过」。
         //
         // `bad-request` / `corrupt-session` 这类是**系统性**问题（载荷形状不对、
