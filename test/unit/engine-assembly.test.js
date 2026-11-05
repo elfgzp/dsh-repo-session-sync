@@ -110,6 +110,11 @@ async function makeEngine(options) {
 
   /** Ordered log of seam invocations, so tests can assert sequencing. */
   const order = []
+  /** Anchor handed to `transport.push`, so tests can assert it travelled. */
+  let pushedAnchor
+  const spy = {
+    get pushedAnchor() { return pushedAnchor },
+  }
 
   const deps = {
     store,
@@ -178,8 +183,9 @@ async function makeEngine(options) {
         order.push('transport.probe')
         return { reachable: true, remote: 'origin', head: 'abc123', hasBundle: true }
       },
-      async push(b, bundle) {
+      async push(b, bundle, opts) {
         order.push('transport.push')
+        pushedAnchor = opts?.anchor
         pushedSessions?.(bundle)
         return {
           ok: true,
@@ -247,6 +253,30 @@ async function makeEngine(options) {
         return { ok: false, regression: true, reason: '可见性偏离' }
       },
     },
+    // Anchors are advisory. Supplied explicitly so a missing seam cannot be
+    // swallowed by the engine's try/catch and quietly disable the anchor path
+    // for every test — which would make the anchor assertions below vacuous.
+    anchors: options.anchors ?? {
+      async captureAnchor(repoPath) {
+        return {
+          headCommit: 'a'.repeat(40),
+          branch: 'main',
+          dirtyCount: 0,
+          capturedAt: Date.now(),
+          worktree: null,
+        }
+      },
+      async describeAnchorDrift() {
+        return {
+          status: 'current',
+          commitsBehind: 0,
+          shortSha: 'aaaaaaa',
+          message: '基于当前代码状态',
+          advisory: true,
+        }
+      },
+      normalizeAnchor: (value) => value ?? null,
+    },
     log: { info() {}, warn() {}, error() {} },
   }
 
@@ -258,7 +288,7 @@ async function makeEngine(options) {
 
   await store.writeBindings(makeTable([binding]))
 
-  return { engine, order }
+  return { engine, order, spy }
 }
 
 /**
@@ -704,5 +734,131 @@ test('down：本机领先远端 → 跳过（等下次上行），不能报成 g
     assert.equal(result.ok, true, '本机领先是正常状态，不该失败')
     assert.equal(result.conflicts.length, 0, '本机领先不能被报成冲突')
     assert.equal(result.transferred, 0, '本机更全，不需要写入')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Code anchors (ADR-5)
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('up：锚点必须随上传走 —— 它是「这段对话基于哪个 commit」的唯一载体', async () => {
+  await withScenario(async ({ dir, binding, store }) => {
+    let captured
+    const anchor = {
+      headCommit: 'b'.repeat(40),
+      branch: 'feature-x',
+      dirtyCount: 2,
+      capturedAt: Date.now(),
+      worktree: null,
+    }
+
+    const { engine, spy } = await makeEngine({
+      dir,
+      binding,
+      store,
+      localList: [],
+      anchors: {
+        async captureAnchor() { captured = true; return anchor },
+        async describeAnchorDrift() { return { status: 'current', advisory: true } },
+        normalizeAnchor: (v) => v ?? null,
+      },
+    })
+
+    const result = await engine.up({ repoId: binding.id })
+
+    assert.equal(captured, true, '上行必须捕获锚点')
+    // The decisive assertion: the anchor must reach `transport.push`, because that
+    // is what writes it into the manifest and carries it to the other machine.
+    // Merely surfacing it in the local result would leave the remote with no
+    // anchor at all, and the drift hint could never work on the other side.
+    assert.deepEqual(spy.pushedAnchor, anchor, '锚点必须传给 transport.push（写进 manifest）')
+    assert.deepEqual(result.anchor, anchor, '锚点必须出现在结果里')
+  })
+})
+
+test('up：捕获锚点失败不应阻断上传（锚点只是提示信息）', async () => {
+  await withScenario(async ({ dir, binding, store }) => {
+    const { engine } = await makeEngine({
+      dir,
+      binding,
+      store,
+      localList: [],
+      anchors: {
+        async captureAnchor() { throw new Error('空仓库，没有 HEAD') },
+        async describeAnchorDrift() { return { status: 'none', advisory: true } },
+        normalizeAnchor: (v) => v ?? null,
+      },
+    })
+
+    const result = await engine.up({ repoId: binding.id })
+    assert.equal(result.ok, true, '没有锚点也要能同步 —— 空仓库/非 git 目录是合法的')
+  })
+})
+
+test('down：锚点漂移必须逐会话报告，且不阻断同步', async () => {
+  await withScenario(async ({ dir, binding, store }) => {
+    const { engine } = await makeEngine({
+      dir,
+      binding,
+      store,
+      remoteSessions: [
+        {
+          sessionId: 'sess-anchored',
+          eventCount: 2,
+          content: Buffer.from('x'),
+          events: [{ seq: 0 }, { seq: 1 }],
+          anchor: { headCommit: 'c'.repeat(40), branch: 'main', capturedAt: Date.now() },
+        },
+      ],
+      registryOutcome: { attached: ['sess-anchored'] },
+      anchors: {
+        async captureAnchor() { return null },
+        async describeAnchorDrift(_repoPath, anchor) {
+          assert.equal(anchor.headCommit, 'c'.repeat(40), '必须拿远端的锚点来比')
+          return {
+            status: 'behind',
+            commitsBehind: 3,
+            shortSha: 'ccccccc',
+            message: '该会话记录于 3 个提交之前',
+            advisory: true,
+          }
+        },
+        normalizeAnchor: (v) => v ?? null,
+      },
+    })
+
+    const result = await engine.down({ repoId: binding.id })
+
+    assert.equal(result.ok, true, '锚点漂移只是提示，不能阻断')
+    assert.equal(result.anchorDrift.length, 1)
+    assert.equal(result.anchorDrift[0].sessionId, 'sess-anchored')
+    assert.equal(result.anchorDrift[0].commitsBehind, 3)
+    assert.equal(result.anchorDrift[0].status, 'behind')
+  })
+})
+
+test('down：远端没带锚点时不做漂移计算（不要编造提示）', async () => {
+  await withScenario(async ({ dir, binding, store }) => {
+    let called = false
+    const { engine } = await makeEngine({
+      dir,
+      binding,
+      store,
+      remoteSessions: [
+        { sessionId: 'sess-legacy', eventCount: 1, content: Buffer.from('y'), events: [{ seq: 0 }] },
+      ],
+      registryOutcome: { attached: ['sess-legacy'] },
+      anchors: {
+        async captureAnchor() { return null },
+        async describeAnchorDrift() { called = true; return { status: 'none', advisory: true } },
+        normalizeAnchor: (v) => v ?? null,
+      },
+    })
+
+    const result = await engine.down({ repoId: binding.id })
+
+    assert.equal(called, false, '没有锚点就不该去比对')
+    assert.deepEqual(result.anchorDrift, [])
+    assert.equal(result.ok, true)
   })
 })

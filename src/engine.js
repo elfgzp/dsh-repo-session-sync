@@ -244,7 +244,7 @@ export class OperationLock {
  * @returns {SyncEngineFacade} The engine.
  */
 export function createSyncEngine(dependencies, meta = {}) {
-  const { store, paths, sessions, sessionOps, transport, conflicts, registry, visibility, log } = dependencies
+  const { store, paths, sessions, sessionOps, transport, conflicts, registry, visibility, anchors, log } = dependencies
   const lock = new OperationLock()
   const pluginVersion = meta.pluginVersion ?? '0.0.0'
   const config = meta.config ?? {}
@@ -780,11 +780,28 @@ export function createSyncEngine(dependencies, meta = {}) {
       })
     }
 
-    // ── 4) push ───────────────────────────────────────────────────────────
+    // ── 4) capture the anchor, then push ─────────────────────────────────
+    // Captured HERE and only here: the anchor answers "what did the code look like
+    // when this conversation happened?", which is a fact about the uploading
+    // machine at upload time. A download must never overwrite it with its own
+    // HEAD, or the two machines would keep erasing each other's anchor.
+    //
+    // `captureAnchor` costs two git processes (~1.5s on a cold cache), so it runs
+    // once per upload rather than per session.
+    progress?.({ phase: 'anchor' })
+    let anchor = null
+    try {
+      anchor = await anchors.captureAnchor(binding.repoPath)
+    } catch (error) {
+      // Advisory only: a repository with no commits, or a non-git directory, must
+      // not block the conversation from travelling.
+      log?.warn?.('捕获代码锚点失败，本次上行不带锚点', error)
+    }
+
     progress?.({ phase: 'upload', completed: 0, total: collected.length })
     let pushed
     try {
-      pushed = await transport.push(binding, { sessions: collected }, { dryRun })
+      pushed = await transport.push(binding, { sessions: collected }, { dryRun, anchor })
     } catch (error) {
       const body = toFailureBody(error)
       return finish({
@@ -803,14 +820,14 @@ export function createSyncEngine(dependencies, meta = {}) {
 
     // ── 5) record the anchor + remote head so the next run can compare ────
     if (result.dryRun !== true) {
-      const head = await resolveRepoHead(binding.repoPath)
       await recordRepoState(binding.id, {
         ...repoState,
         visibility: repoState.visibility,
         lastUpAt: Date.now(),
         lastResult: 'ok',
         remoteHead: pushed?.head ?? repoState.remoteHead,
-        localHead: head?.commit ?? repoState.localHead,
+        localHead: anchor?.headCommit ?? repoState.localHead,
+        anchor: anchor ?? repoState.anchor,
         sessionCount: collected.length,
       })
     }
@@ -822,7 +839,7 @@ export function createSyncEngine(dependencies, meta = {}) {
       message: result.dryRun
         ? `预演：将上传 ${collected.length} 个会话。`
         : `已上传 ${result.transferred} 个会话。`,
-      anchor: { commit: repoState.localHead ?? null },
+      anchor: anchor ?? repoState.anchor ?? null,
       visibility: gate.visibility,
     })
   }
@@ -879,6 +896,8 @@ export function createSyncEngine(dependencies, meta = {}) {
 
     /** Sessions this run created or extended. The rollback set. */
     const touched = []
+    /** Per-session anchor drift. Advisory: reported, never acted on. */
+    const anchorsOut = []
     const skippedSessions = []
 
     for (const remote of incoming) {
@@ -898,6 +917,25 @@ export function createSyncEngine(dependencies, meta = {}) {
             backupPath: decision.backupPath ?? null,
           })
           result.transferred += 1
+
+          // Anchor drift — advisory, never blocking. This answers the question the
+          // user actually has ("is this conversation stale?") rather than printing
+          // a commit hash. Computed against the anchor that travelled WITH the
+          // session, not against anything local, because the interesting delta is
+          // between the uploading machine's code state and this one's.
+          if (remote.anchor !== null && remote.anchor !== undefined) {
+            try {
+              const drift = await anchors.describeAnchorDrift(
+                binding.repoPath,
+                anchors.normalizeAnchor(remote.anchor),
+              )
+              if (drift !== null && drift !== undefined) {
+                anchorsOut.push({ sessionId: remote.sessionId, ...drift })
+              }
+            } catch (error) {
+              log?.warn?.('计算代码锚点漂移失败', error)
+            }
+          }
         } else if (decision.kind === 'skipped') {
           result.skipped += 1
           if (decision.reason !== 'up-to-date') {
@@ -1046,6 +1084,9 @@ export function createSyncEngine(dependencies, meta = {}) {
         ? `预演：将写入 ${result.transferred} 个会话。`
         : `已下载 ${result.transferred} 个会话，全部可见。`,
       attached: reg.attached ?? [],
+      // Advisory drift reports, shape: { sessionId, status, commitsBehind, shortSha, message }.
+      // `status` is one of current / behind / diverged / missing-commit / none / unknown.
+      anchorDrift: anchorsOut,
       visibility: gate.visibility,
     })
   }
@@ -1180,28 +1221,6 @@ export function createSyncEngine(dependencies, meta = {}) {
     } catch {
       // An unreadable local session is treated as absent: writing it is a no-op
       // for a session that already matches, and `write()` backs up first anyway.
-      return null
-    }
-  }
-
-  /**
-   * Resolve the repository's current commit, for the anchor.
-   *
-   * Best effort: an anchor is informational, and failing the whole sync because
-   * `git rev-parse` hiccuped would be disproportionate.
-   *
-   * @param {string} repoPath - Repository path.
-   * @returns {Promise<{commit: string, branch: string}|null>} Head facts or null.
-   */
-  async function resolveRepoHead(repoPath) {
-    try {
-      const { execFile } = await import('node:child_process')
-      const { promisify } = await import('node:util')
-      const run = promisify(execFile)
-      const { stdout } = await run('git', ['-C', repoPath, 'rev-parse', 'HEAD'], { timeout: 10_000 })
-      const commit = String(stdout).trim()
-      return commit === '' ? null : { commit }
-    } catch {
       return null
     }
   }

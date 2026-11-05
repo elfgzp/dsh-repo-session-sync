@@ -96,12 +96,14 @@ export async function assembleDependencies(context) {
     conflictModule,
     registryModule,
     visibilityModule,
+    anchorModule,
   ] = await Promise.all([
     importIfPresent('./session-store.js'),
     importIfPresent('./transport.js'),
     importIfPresent('./conflict.js'),
     importIfPresent('./registry.js'),
     importIfPresent('./repo-visibility.js'),
+    importIfPresent('./anchor.js'),
   ])
 
   const sessions = sessionModule?.createSessionSource !== undefined
@@ -169,11 +171,29 @@ export async function assembleDependencies(context) {
       }
     : missingSeam('会话增量写入', 'src/session-store.js', ['appendToSession', 'classifyIncoming'])
 
+  // Anchors are advisory only: they tell the user "this conversation was recorded
+  // when your branch was N commits behind", and never gate a sync. A missing
+  // `anchor.js` therefore degrades to "no anchor" rather than failing a run.
+  const anchors = anchorModule !== undefined
+    ? {
+        captureAnchor: anchorModule.captureAnchor,
+        describeAnchorDrift: anchorModule.describeAnchorDrift,
+        normalizeAnchor: anchorModule.normalizeAnchor,
+      }
+    : {
+        async captureAnchor() { return null },
+        async describeAnchorDrift() {
+          return { status: 'none', commitsBehind: null, shortSha: null, message: '', advisory: true }
+        },
+        normalizeAnchor: (value) => value ?? null,
+      }
+
   return {
     store,
     paths,
     sessions,
     sessionOps,
+    anchors,
     transport,
     conflicts,
     registry,
@@ -208,6 +228,7 @@ export async function detectSeams() {
     importIfPresent('./conflict.js'),
     importIfPresent('./registry.js'),
     importIfPresent('./repo-visibility.js'),
+    importIfPresent('./anchor.js'),
   ])
   return {
     sessions: sessionModule !== undefined,
@@ -215,5 +236,6 @@ export async function detectSeams() {
     conflicts: conflictModule !== undefined,
     registry: registryModule !== undefined,
     visibility: visibilityModule !== undefined,
+    anchors: anchorModule !== undefined,
   }
 }
