@@ -22,13 +22,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Two runtimes on purpose:
-        #  - 20 has NO zlib.zstdDecompressSync, so it exercises the pure-JS
-        #    frame decoding path. Without this the matrix would silently never
-        #    test that code.
-        #  - 22 is the minimum the package declares (engines >= 22.19) and does
-        #    have the native zstd API.
-        node: ['20', '22']
+        # Two runtimes on purpose, chosen so that BOTH decode paths are really
+        # exercised. `zlib.zstdDecompressSync` landed in Node v22.15.0, so:
+        #  - 20.x has NO native zstd  -> covers the pure-JS frame decoder
+        #  - 22.x has native zstd     -> covers the runtime decoder
+        # Pinning exact minimums (not bare '20'/'22') matters: if the runner ever
+        # picked a 22.0-22.14 image, the "native zstd" job would silently test
+        # the fallback path instead and the matrix would stop covering anything
+        # new. The step below asserts the capability at runtime so this cannot
+        # regress quietly.
+        node: ['20.x', '22.15']
     steps:
       - uses: actions/checkout@v4
 
@@ -37,11 +40,23 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
-      - name: Show environment
+      - name: Show environment and assert the zstd capability matches the job's purpose
         run: |
           node --version
           git --version
-          node -e "console.log('native zstd:', typeof require('node:zlib').zstdDecompressSync)"
+          node -e "
+            const native = typeof require('node:zlib').zstdDecompressSync === 'function';
+            console.log('native zstd:', native);
+            const expected = process.env.EXPECT_NATIVE_ZSTD === '1';
+            if (native !== expected) {
+              console.error('::error::This job expects native zstd = ' + expected + ' but got ' + native +
+                ' on node ' + process.version + '. The matrix no longer covers both code paths.');
+              process.exit(1);
+            }
+          "
+        env:
+          # node 20 -> pure-JS path; node 22.15+ -> native path.
+          EXPECT_NATIVE_ZSTD: ${{ startsWith(matrix.node, '22') && '1' || '0' }}
 
       - name: Configure git identity
         # The transport tests create real repositories and commits. CI runners
