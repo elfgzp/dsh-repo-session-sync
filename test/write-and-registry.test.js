@@ -181,6 +181,17 @@ test('writeSession：新会话写入后可被 readSessionDir 读回', async (t) 
     assert.equal(record.nextSeq, 7)
     assert.equal(record.tornTail, false)
 
+    // 目录结构必须与真实 DSH 会话一致 —— 真实会话 100% 带 session.lock。
+    // 缺了它，isSessionLive() 会走「没有 lock → 不可能有活跃写入者」的短路，
+    // 于是我们写出的会话 LIVE 检测永久失效，可能覆盖用户正在使用的会话。
+    const files = await readdir(dir)
+    assert.ok(
+      files.includes('session.lock'),
+      `写入的会话必须包含 session.lock，实际目录内容：${JSON.stringify(files)}`
+    )
+    // 必须是 0 字节占位，不能带内容（真实 DSH 的 lock 就是空的）
+    assert.equal((await stat(join(dir, 'session.lock'))).size, 0)
+
     // 首次写入不需要备份
     assert.equal(result.backupPath, null)
   } finally {
@@ -1053,6 +1064,131 @@ test('往返幂等：A→B→A 重写 cwd 后帧数与事件数不增长', async
     const recordRepeat = await readSessionDir(repeat.sessionDir)
     assert.equal(recordRepeat.frames, recordA2.frames, '重复写入不得让帧数变化')
     assert.equal(recordRepeat.nextSeq, recordA2.nextSeq)
+  } finally {
+    await sandbox.cleanup()
+  }
+})
+
+test('【结构性】writeSession 产出的会话 LIVE 检测必须真正生效（不能永久短路）', async (t) => {
+  if (!hasNativeZstd) {
+    t.diagnostic('无原生 zstd 压缩，跳过')
+    return
+  }
+  const sandbox = await makeSandbox()
+  try {
+    const backupDir = join(sandbox.home, 'backups')
+    const payload = makePayload('live-effective', { events: 3 })
+    const written = await writeSession(payload, {
+      sessionsRoot: sandbox.sessionsRoot,
+      backupDir,
+    })
+
+    // ① 目录结构必须与真实 DSH 一致（含 0 字节 lock）
+    const files = await readdir(written.sessionDir)
+    assert.ok(
+      files.includes('session.lock'),
+      `结构与真实 DSH 会话不一致，缺 session.lock。实际：${JSON.stringify(files)}`
+    )
+
+    // ② 无持有者时：应走到 lsof 探测，而不是「没有 lock 文件」的短路
+    const free = await isSessionLive(written.sessionDir, {
+      execFile: async (command) =>
+        command === 'lsof'
+          ? { available: true, code: 1, stdout: '', stderr: '' }
+          : { available: false, code: 127, stdout: '', stderr: '' },
+    })
+    assert.equal(free.live, false)
+    assert.equal(
+      free.method,
+      'lsof',
+      '有了 lock 文件后，检测应该真的去问 lsof，而不是短路成 no-lock-file'
+    )
+
+    // ③ 有持有者时：必须能检出 live —— 这条是核心
+    //    如果目录里没有 lock，这里会拿不到 live=true，保护就形同虚设。
+    const held = await isSessionLive(written.sessionDir, {
+      execFile: async (command) =>
+        command === 'lsof'
+          ? {
+              available: true,
+              code: 0,
+              stdout:
+                'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n' +
+                'dsh 4242 gzp 8w REG 1,2 0 1 session.lock\n',
+              stderr: '',
+            }
+          : { available: false, code: 127, stdout: '', stderr: '' },
+    })
+    assert.equal(held.live, true, 'writeSession 产出的会话必须能被 LIVE 检测认出正被使用')
+
+    // ④ 真到写入这一步也必须被拦住
+    await writeFile(join(written.sessionDir, 'session.lock'), '')
+    await assert.rejects(
+      () =>
+        appendToSession(
+          {
+            sessionId: payload.sessionId,
+            header: payload.header,
+            events: [
+              { type: 'assistant/message', seq: 3, time: 1, data: {} },
+            ],
+          },
+          {
+            sessionsRoot: sandbox.sessionsRoot,
+            backupDir,
+            lockProbeRunner: async (command) =>
+              command === 'lsof'
+                ? {
+                    available: true,
+                    code: 0,
+                    stdout:
+                      'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\ndsh 1 gzp 8w REG 1,2 0 1 x\n',
+                    stderr: '',
+                  }
+                : { available: false, code: 127, stdout: '', stderr: '' },
+          }
+        ),
+      (err) => err.code === 'busy',
+      'LIVE 会话必须拒绝追加'
+    )
+  } finally {
+    await sandbox.cleanup()
+  }
+})
+
+test('【结构修复】appendToSession 会补齐缺失的 session.lock（老数据兼容）', async (t) => {
+  if (!hasNativeZstd) {
+    t.diagnostic('无原生 zstd 压缩，跳过')
+    return
+  }
+  const sandbox = await makeSandbox()
+  try {
+    const backupDir = join(sandbox.home, 'backups')
+    const payload = makePayload('lock-repair', { events: 3 })
+    const written = await writeSession(payload, {
+      sessionsRoot: sandbox.sessionsRoot,
+      backupDir,
+    })
+
+    // 模拟「老版本 writeSession 写出的会话」：删掉 lock
+    const { rm } = await import('node:fs/promises')
+    await rm(join(written.sessionDir, 'session.lock'))
+    assert.ok(!(await readdir(written.sessionDir)).includes('session.lock'))
+
+    await appendToSession(
+      {
+        sessionId: payload.sessionId,
+        header: payload.header,
+        events: [{ type: 'assistant/message', seq: 3, time: 1, data: {} }],
+      },
+      { sessionsRoot: sandbox.sessionsRoot, backupDir }
+    )
+
+    // 追加时应顺手把 lock 补回来，恢复与 DSH 一致的结构
+    assert.ok(
+      (await readdir(written.sessionDir)).includes('session.lock'),
+      'appendToSession 应补齐缺失的 session.lock'
+    )
   } finally {
     await sandbox.cleanup()
   }
