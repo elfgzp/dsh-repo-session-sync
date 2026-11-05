@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# 由 scripts/check-private.sh 提供隐私闸门。
+# 启用：git config core.hooksPath .githooks
+exec "$(git rev-parse --show-toplevel)/scripts/check-private.sh" --staged
