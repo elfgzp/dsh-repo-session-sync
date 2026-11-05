@@ -1222,7 +1222,7 @@ export function createSyncEngine(dependencies, meta = {}) {
           // A brand-new session has no local directory yet, so its header must be
           // rewritten to THIS machine's repository path — otherwise `attachSession`
           // compares against a path that does not exist here and rejects it.
-          // MUTATION: cwdOverride removed
+          cwdOverride: canonical,
           dryRun,
         },
       )
