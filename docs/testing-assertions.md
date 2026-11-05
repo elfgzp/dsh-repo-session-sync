@@ -360,6 +360,47 @@ removed oids= 0
 **为什么**：dry-run 的承诺是"告诉你实际执行会发生什么"。
 如果预演说没问题、实跑却失败，dry-run 就是骗人的。
 
+### G2b — 下行写入的会话必须与 DSH 原生目录结构一致（含 `session.lock`）
+
+**断言**：下行写入后，会话目录内容与真实 DSH 会话目录**结构一致**：
+至少包含 `session.v4.jsonl.zstd` 与 `session.lock`。
+
+**为什么这条必须有（它是一条真实存在过的盲区）**：
+
+`isSessionLive()` 的第一步是短路判断：
+
+```js
+if (!(await pathExists(lockFile))) {
+  return { live: false, checked: true, method: 'no-lock-file' }   // 直接判定"不活跃"
+}
+```
+
+如果 `writeSession` 创建会话时**不写 `session.lock`**，那么：
+
+1. 该会话的 LIVE 检测**永远返回 not-live**
+2. 后续任何下行都会愿意写入它——**即使 DSH 正在使用它**
+3. 这正是 §G1 要防的场景，却被"目录结构不一致"整个绕过
+
+**实测依据**（对真实 219 个会话统计 lock 与 log 的 mtime 关系）：
+
+```
+sessions with lock              : 219/219
+lock mtime 明显晚于 log (>5s)   : 2
+lock OLDER than log             : 217/219   ← lock 在会话出生时创建，log 之后持续增长
+```
+
+`217/219` 说明 DSH 在**创建会话时**建 lock，而非每次打开补建。
+推论：**不写 lock 的会话，DSH 很可能永远不会为它补建**，故该盲区是永久性的。
+
+> ⚠️ 这条是**统计推断**，未拿到 DSH 源码确认「打开会话是否 `O_CREAT`」。
+> 断言只管**让我们的产物与原生结构一致**，不依赖那个未确认的结论。
+
+**为什么现有测试全绿却漏了它**：qa 的 G1 用例是在 fixture 里**手工创建** `session.lock`
+再测检测逻辑的。而真实下行路径产生的会话**根本没有 lock**——
+**测试都在验证"有 lock 时检测对不对"，没人验证"我们产出的会话有没有 lock"。**
+
+---
+
 ### G3 — 无 lsof/fuser 时如实报告"没查成"
 
 **断言**：探测工具不可用时，结果标记为 `checked: false`，
