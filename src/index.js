@@ -298,6 +298,16 @@ export function apply(ctx, rawConfig) {
     engine = createSyncEngine(dependencies, {
       pluginVersion: VERSION,
       config: sanitizeConfigForDisplay(resolved.config, resolved.paths),
+      // A getter, not a value: the engine is built here, but the registry service
+      // may publish later in the boot, and a plugin reload can republish it. A
+      // captured snapshot would go stale and turn every download into a
+      // false "registry unavailable".
+      //
+      // Deliberately NOT in `inject`: declaring it a hard dependency would make
+      // the whole plugin fail to activate on a headless deployment, taking the
+      // settings page and the tool with it. `ctx.get` returns undefined there,
+      // and the engine reports `registry-unavailable` for downloads only.
+      getWorkspaceRegistry: () => safeGet(ctx, 'workspaceRegistry'),
     })
     const seams = await detectSeams()
     log.info('已加载', { stateDir: displayPath(resolved.paths.stateDir), seams })

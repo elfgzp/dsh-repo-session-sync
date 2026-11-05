@@ -249,6 +249,12 @@ export class StateStore {
  *
  * @typedef {object} RepoSyncState
  * @property {string} repoId - Which binding this belongs to.
+ * @property {{verdict: string, slug?: string, at?: number}} [visibility]
+ *   The visibility the user *consented to* — not the last thing detected. The
+ *   distinction is the whole point: comparing against "what I saw last time"
+ *   would let a repository go private → public → private and pass, because the
+ *   last observation always matches itself. Only an explicit consent record can
+ *   answer "did this get more visible than the user agreed to?".
  * @property {number} [lastUpAt] - Epoch ms of the last successful upload.
  * @property {number} [lastDownAt] - Epoch ms of the last successful download.
  * @property {string} [lastResult] - Last outcome code, e.g. `up-to-date`.
@@ -256,6 +262,10 @@ export class StateStore {
  * @property {string} [localHead] - Local commit id at the last successful sync.
  * @property {number} [sessionCount] - Sessions known for this repository.
  * @property {string} [backupPath] - Most recent backup directory, for recovery.
+ * @property {string} [lastError] - Last failure code, so the row can explain itself.
+ * @property {number} [lastErrorAt] - When that failure happened.
+ * @property {{verdict: string, slug: string, at: number}} [visibility]
+ *   The visibility the user consented to for this repository.
  */
 
 /**
@@ -305,6 +315,16 @@ export function normalizeStateDocument(document) {
       if (typeof row.localHead === 'string') normalized.localHead = row.localHead
       if (Number.isFinite(Number(row.sessionCount))) normalized.sessionCount = Number(row.sessionCount)
       if (typeof row.backupPath === 'string') normalized.backupPath = row.backupPath
+      if (typeof row.lastError === 'string') normalized.lastError = row.lastError
+      if (Number.isFinite(Number(row.lastErrorAt))) normalized.lastErrorAt = Number(row.lastErrorAt)
+      const vis = row.visibility
+      if (vis !== null && typeof vis === 'object' && typeof vis.verdict === 'string') {
+        normalized.visibility = {
+          verdict: vis.verdict,
+          slug: typeof vis.slug === 'string' ? vis.slug : '',
+          at: Number.isFinite(Number(vis.at)) ? Number(vis.at) : 0,
+        }
+      }
       repos[repoId] = normalized
     }
   }

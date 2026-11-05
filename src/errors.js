@@ -87,6 +87,14 @@ export const ERROR_CODES = Object.freeze({
   BACKUP_FAILED: 'backup-failed',
   /** Refused because the target is the user's live data outside a test home. */
   REFUSED_UNSAFE_TARGET: 'refused-unsafe-target',
+  /** The remote repository's visibility was never confirmed by the user. */
+  VISIBILITY_UNCONFIRMED: 'visibility-unconfirmed',
+  /** The remote repository became more visible than the user consented to. */
+  VISIBILITY_REGRESSION: 'visibility-regression',
+  /** Sessions were written but could not be made visible; they were rolled back. */
+  REGISTRY_ATTACH_FAILED: 'registry-attach-failed',
+  /** No workspace registry is available, so the visibility loop cannot close. */
+  REGISTRY_UNAVAILABLE: 'registry-unavailable',
 
   // ── runtime ───────────────────────────────────────────────────────────────
   /** Implemented later by the engine owner; the skeleton reports this. */
