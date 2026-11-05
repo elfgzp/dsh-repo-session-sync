@@ -41,6 +41,42 @@ const SRC = join(ROOT, 'src')
 
 const JSON_OUT = process.argv.includes('--json')
 
+/**
+ * 零依赖的 zstd **raw block** 帧编码器（RFC 8878 §3.1.1.3）。
+ *
+ * 为什么需要：`writeSession` 依赖原生 `zlib.zstdCompressSync`（Node >= 22.15）。
+ * 没有它时我们本来只能 SKIP——**但 skip 等于什么都没验证**。
+ * 注入一个自制的编码器就能在任意 Node 上真正跑完这条检查。
+ *
+ * 这份实现刻意内联在本文件里（而不是 import `test/lib/zstd-frame.mjs`），
+ * 因为 `scripts/` 不应该依赖 `test/`——那会让审计脚本在只 checkout 源码时跑不起来。
+ * 两处实现各自独立、由本脚本的校验来保证产出确实可解码。
+ *
+ * @param {Buffer|string} payload
+ * @returns {Buffer} 一个完整、自足的 zstd 帧
+ */
+function encodeRawFrame(payload) {
+  const data = Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload), 'utf8')
+  const MAX_BLOCK = 128 * 1024
+  const parts = [Buffer.from([0x28, 0xb5, 0x2f, 0xfd])] // magic
+  parts.push(Buffer.from([0xa0])) // FHD: FCS 4 bytes little-endian, single segment
+  const fcs = Buffer.alloc(4)
+  fcs.writeUInt32LE(data.length, 0)
+  parts.push(fcs)
+  const blockCount = Math.max(1, Math.ceil(data.length / MAX_BLOCK))
+  for (let i = 0; i < blockCount; i++) {
+    const chunk = data.subarray(i * MAX_BLOCK, Math.min((i + 1) * MAX_BLOCK, data.length))
+    const last = i === blockCount - 1 ? 1 : 0
+    const headerValue = (last & 0x1) | ((0 & 0x3) << 1) | ((chunk.length & 0x1fffff) << 3)
+    const header = Buffer.alloc(3)
+    header.writeUIntLE(headerValue, 0, 3)
+    parts.push(header, chunk)
+  }
+  return Buffer.concat(parts)
+}
+
+
+
 /** @type {Array<{id: string, claim: string, ok: boolean, detail?: string}>} */
 const results = []
 
@@ -231,9 +267,10 @@ async function main() {
       }
       const sessionsRoot = join(root, 'sessions')
       const backupDir = join(root, 'backup')
+      // 总是注入自制编码器：这样本检查在任何 Node 上都真跑，不会退化成 SKIP。
       await sessionStore.writeSession(
         { sessionId, header, events: [{ type: 'user/message', seq: 0, time: 0, data: {} }] },
-        { sessionsRoot, backupDir }
+        { sessionsRoot, backupDir, frameEncoder: encodeRawFrame }
       )
       const dir = join(sessionsRoot, sessionStore.projectKey(cwd), sessionStore.encodeSegment(sessionId))
       const files = readdirSync(dir)
@@ -244,18 +281,7 @@ async function main() {
         files.join(',')
       )
     } catch (error) {
-      const noZstd = /没有 zstd 压缩能力/.test(String(error?.message))
-      if (noZstd) {
-        check(
-          'G2b',
-          `SKIP：当前 Node ${process.version} 无 zstd 压缩能力，无法验证（环境限制，非实现缺陷）`,
-          true,
-          'skipped'
-        )
-        results[results.length - 1].skipped = true
-      } else {
-        check('G2b', 'writeSession 创建的会话目录包含 session.lock', false, String(error?.message))
-      }
+      check('G2b', 'writeSession 创建的会话目录包含 session.lock', false, String(error?.message))
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
@@ -370,7 +396,7 @@ async function main() {
       const backupDir = join(root, 'backup')
       await sessionStore.writeSession(
         { sessionId, header, events: [{ type: 'user/message', seq: 0, time: 0, data: {} }] },
-        { sessionsRoot, backupDir }
+        { sessionsRoot, backupDir, frameEncoder: encodeRawFrame }
       )
       const dir = join(sessionsRoot, sessionStore.projectKey(cwd), sessionStore.encodeSegment(sessionId))
       const { readFileSync } = await import('node:fs')
@@ -407,16 +433,7 @@ async function main() {
         `${drift.status} n=${drift.commitsBehind}`
       )
     } catch (error) {
-      const noZstd = /没有 zstd 压缩能力/.test(String(error?.message))
-      check(
-        'H5',
-        noZstd
-          ? `SKIP：当前 Node ${process.version} 无 zstd 压缩能力，无法验证（环境限制）`
-          : '锚点能随载荷跨机传递',
-        noZstd,
-        String(error?.message)
-      )
-      if (noZstd) results[results.length - 1].skipped = true
+      check('H5', '锚点能随载荷跨机传递（push -> manifest -> pull）', false, String(error?.message))
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
@@ -424,19 +441,17 @@ async function main() {
 
   // ── 汇总 ────────────────────────────────────────────────────────────
   const failed = results.filter((r) => !r.ok)
-  const skipped = results.filter((r) => r.skipped === true)
 
   if (JSON_OUT) {
     process.stdout.write(JSON.stringify({ results, passed: results.length - failed.length, failed: failed.length }, null, 2) + '\n')
   } else {
     for (const r of results) {
-      const mark = r.skipped === true ? 'SKIP' : r.ok ? 'PASS' : 'FAIL'
+      const mark = r.ok ? 'PASS' : 'FAIL'
       process.stdout.write(`${mark}  ${r.id.padEnd(7)} ${r.claim}\n`)
       if (!r.ok && r.detail !== '') process.stdout.write(`        └─ ${r.detail}\n`)
     }
     process.stdout.write(
       `\n${results.length - failed.length}/${results.length} 通过` +
-        (skipped.length > 0 ? `（${skipped.length} 条因环境限制被跳过，见上 SKIP）` : '') +
         (failed.length === 0 ? '  ✅ 实现符合设计' : `  ❌ ${failed.length} 条违规`) +
         '\n'
     )
