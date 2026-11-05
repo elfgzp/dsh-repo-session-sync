@@ -250,6 +250,17 @@ export function createSyncEngine(dependencies, meta = {}) {
   const config = meta.config ?? {}
 
   /**
+   * Skip reasons that mean "nothing to do", not "something went wrong".
+   *
+   * Distinguishing them matters because a download where every session is already
+   * current writes nothing, and a zero-write result must not be reported as a
+   * failed sync. Only reasons outside this set count as processing failures.
+   *
+   * @type {ReadonlySet<string>}
+   */
+  const BENIGN_SKIP_REASONS = new Set(['up-to-date', 'local-ahead'])
+
+  /**
    * Late-bound accessor for the workspace registry.
    *
    * A getter rather than a captured value because `apply()` resolves the service
@@ -351,6 +362,14 @@ export function createSyncEngine(dependencies, meta = {}) {
       dryRun,
       sessionCount: 0,
       transferred: 0,
+      /** Sessions that could not be processed. A non-zero value on a run that
+       * wrote nothing means the download achieved nothing — a failure. */
+      failed: 0,
+      /** Sessions deliberately left alone because there was nothing to do:
+       * already up to date, or the local copy is ahead. Never a failure. */
+      unchanged: 0,
+      /** Failures and benign skips minus conflicts, kept for compatibility with
+       * existing callers that read `skipped`. */
       skipped: 0,
       bytes: 0,
       conflicts: [],
@@ -937,8 +956,15 @@ export function createSyncEngine(dependencies, meta = {}) {
             }
           }
         } else if (decision.kind === 'skipped') {
-          result.skipped += 1
-          if (decision.reason !== 'up-to-date') {
+          // Two very different things arrive here. `up-to-date` and `local-ahead`
+          // are normal steady states — nothing to do, nothing wrong. Anything else
+          // is a real processing failure (unreadable local session, refused write).
+          // They must not share a counter, or "the whole download was a no-op"
+          // becomes indistinguishable from "the whole download failed".
+          if (BENIGN_SKIP_REASONS.has(decision.reason)) {
+            result.unchanged += 1
+          } else {
+            result.skipped += 1
             skippedSessions.push({ sessionId: remote.sessionId, reason: decision.reason })
           }
         } else if (decision.kind === 'conflict') {
@@ -955,11 +981,36 @@ export function createSyncEngine(dependencies, meta = {}) {
       } catch (error) {
         const body = toFailureBody(error)
         skippedSessions.push({ sessionId: remote.sessionId, reason: body.code })
-        result.skipped += 1
+        result.failed += 1
       }
     }
 
     if (skippedSessions.length > 0) result.skippedSessions = skippedSessions
+
+    // ── 一个会话都没写成功，就不能报成功 ───────────────────────────────────
+    //
+    // 注册失败的检查只在 touched 非空时才会走到，所以「全部会话都在写入阶段
+    // 失败」这种情况会漏过去：touched 为空 → 不调 registry → reg.ok 保持默认
+    // true → 最终报「已下载 0 个会话，全部可见」。
+    //
+    // 那是对用户的谎报：他打开侧栏什么都看不到，却被告知全部可见。宁可显式
+    // 报失败并给出每个会话的原因，也不要给一个看起来成功的结果。
+    //
+    // Keyed on `failed` rather than `skipped`: a download where every session was
+    // already up to date writes nothing and is a perfectly good outcome, not a
+    // failure to report.
+    if (touched.length === 0 && result.failed > 0 && result.dryRun !== true) {
+      return finish({
+        ok: false,
+        code: ERROR_CODES.BAD_REQUEST,
+        message: `没有会话被写入：${result.failed} 个会话在处理阶段就失败了。`,
+        hint: '看下面的失败原因逐条处理；常见原因是本地会话正在使用中，或远端包与本机记录不一致。',
+        detail: {
+          skippedSessions: result.skippedSessions ?? [],
+          conflicts: result.conflicts,
+        },
+      })
+    }
 
     // ── registration: the actual completion criterion ─────────────────────
     let reg = { ok: true, attached: [], failed: [], canonical }

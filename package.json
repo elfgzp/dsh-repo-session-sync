@@ -66,6 +66,7 @@
     "check": "node --check src/index.js && node --check client.js && node scripts/build-client.mjs --check",
     "smoke": "bash scripts/smoke-load.sh",
     "test:unit": "node --test \"test/**/*.test.js\"",
-    "build:client": "node scripts/build-client.mjs"
+    "build:client": "node scripts/build-client.mjs",
+    "verify:adr": "node scripts/verify-adr.mjs"
   }
 }
