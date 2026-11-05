@@ -35,7 +35,50 @@ git commit -m "..."
 
 **禁止** `git add -A`、`git add .`、`git commit -a`。
 
-### R2 — add 与 commit 之间不要插入其它命令
+#
+## R1 升级（2026-11 修订）— 用 `--only` 彻底绕开共享索引
+
+R1 的 `git reset` + 显式 `git add` **仍然有竞态窗口**：`reset` 与 `add` 之间
+任何其他 agent 执行 `git add`，其文件都会落进同一暂存区。
+
+**实测复现（真实发生过）**：arch 按 R1 做了 `git reset` + `git add`，中间
+`docs/prd.md` 被别人暂存进来，`git diff --cached` 才看到多了一个文件。
+
+**正解：`git commit --only`，直接绕开暂存区。**
+
+```bash
+git commit -m "your message" --only -- <file1> <file2>
+```
+
+实测验证（`/tmp` 隔离仓库）：
+
+```
+场景：索引里有 a.txt（我的）和 b.txt（模拟别人的竞态文件）
+$ git commit -m "only a.txt" --only -- a.txt
+实际提交: a.txt
+索引剩余: b.txt        ← 别人的原样保留
+✅ b.txt 未被提交（隔离成功）
+```
+
+`--only` 的语义是「忽略暂存区，只提交命令行点名的路径」。它与别人的
+`git add` 完全无关，因此**竞态窗口消失**。
+
+注意 `--only` 后面必须用 `--` 分隔路径，否则 `-m` 的值会被当作 pathspec。
+
+### 保留 R1 的理由
+先 `git add` 仍有价值：`pre-commit` 钩子读的是暂存区，而
+`scripts/check-private.sh --staged` 依赖它。所以推荐流程是：
+
+```bash
+git add <仅你的文件>
+./scripts/check-private.sh --staged      # 隐私闸门读数
+node --test                              # 测试
+git commit -m "..." --only -- <相同文件>  # 提交仍以 --only 为准
+```
+
+**即使 `git add` 阶段混进了别人的文件，`--only` 也会把它们排除。**
+
+## R2 — add 与 commit 之间不要插入其它命令
 
 中间任何耗时操作都会放大竞态窗口。
 
