@@ -449,6 +449,27 @@ perl -e 'use Fcntl qw(:flock);
          print(flock($fh, LOCK_EX|LOCK_NB) ? "IDLE" : "LIVE");' session.lock
 ```
 
+### 8.1 已知限制：基于 `lsof`/`fuser` 的探测有一个盲区
+
+实现用 `lsof -- <lockfile>`（回退 `fuser`）判断活跃，而不是 `flock`。
+实测两者在正常场景等价：
+
+```
+活跃会话锁 : lsof → 1 行持有者（DeepSeek pid …）；flock → LIVE
+空闲会话锁 : lsof → rc=1、0 行；                 flock → IDLE
+```
+
+`lsof` 反而更好：它能告诉你**持有者是谁**，可写进用户提示。
+
+**盲区**：若锁文件被 `unlink` 但 fd 仍被持有，`lsof -- <path>` 返回
+rc=0 且 **0 行**（只剩 inode，路径已不存在），实现会判为"不活跃"（假阴性）。
+
+**当前不可达**：实测本机 `session.lock` 文件数 **219**、会话目录数 **219**，
+一一对应无缺失 → DSH 不删除/轮换锁文件。
+
+**记录而非修复**：如果将来 DSH 改变了锁文件生命周期，这里会变成真问题。
+届时改用 `flock` 探测（本文件 §8 正文给了命令）可消除该盲区。
+
 > **并发规则**：
 > - **上行（读）**：活跃会话也可安全读——append-only 保证已写部分稳定；
 >   只需在读取前后各取一次 size，若在中间变化则重读该尾帧。
